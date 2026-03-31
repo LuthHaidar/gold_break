@@ -52,8 +52,8 @@ class BacktestConfig:
     max_margin_fraction: float = 0.50
     max_contracts: int = 3
     sensitivity_atr_periods: tuple[int, ...] = (7, 14, 21)
-    sensitivity_atr_multipliers: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0)
-    sensitivity_ks: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00)
+    sensitivity_atr_multipliers: tuple[float, ...] = (0.25, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0)
+    sensitivity_ks: tuple[float, ...] = (0.10, 0.15, 0.25, 0.50, 0.75, 1.00)
     sensitivity_tp_sl_modes: tuple[str, ...] = VALID_TP_SL_MODES
     sensitivity_risk_fractions: tuple[float, ...] = (0.005, 0.01, 0.02)
     sensitivity_max_contracts: tuple[int, ...] = (1, 2, 3, 5, 10)
@@ -198,6 +198,16 @@ def _validate_config(config: BacktestConfig) -> None:
         raise ValueError("max_margin_fraction must be in the interval (0, 1].")
     if config.max_contracts <= 0:
         raise ValueError("max_contracts must be positive.")
+    if any(period <= 0 for period in config.sensitivity_atr_periods):
+        raise ValueError("All sensitivity_atr_periods values must be positive.")
+    if any(multiplier <= 0 for multiplier in config.sensitivity_atr_multipliers):
+        raise ValueError("All sensitivity_atr_multipliers values must be positive.")
+    if any(k <= 0 for k in config.sensitivity_ks):
+        raise ValueError("All sensitivity_ks values must be positive.")
+    if any(mode not in VALID_TP_SL_MODES for mode in config.sensitivity_tp_sl_modes):
+        raise ValueError("sensitivity_tp_sl_modes contains an unsupported mode.")
+    if any(risk_fraction <= 0 for risk_fraction in config.sensitivity_risk_fractions):
+        raise ValueError("All sensitivity_risk_fractions values must be positive.")
     if any(limit <= 0 for limit in config.sensitivity_max_contracts):
         raise ValueError("All sensitivity_max_contracts values must be positive.")
     if config.walk_forward_train_years <= 0:
