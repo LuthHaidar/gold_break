@@ -140,6 +140,8 @@ class BacktestResult:
     direction_summary: pd.DataFrame
     annual_summary: pd.DataFrame
     exit_breakdown: pd.DataFrame
+    benchmark_curves: pd.DataFrame
+    benchmark_summary: pd.DataFrame
     validation_results: pd.DataFrame
     diagnostics: dict[str, Any]
 
@@ -1541,6 +1543,217 @@ def _build_equity_curve(data: pd.DataFrame, event_log: pd.DataFrame, starting_ca
     return curve.reset_index(drop=True)
 
 
+def _build_normalized_gc_price_benchmark(
+    data: pd.DataFrame,
+    starting_capital: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    curve = data[
+        ["ts_event", "session_id", "session_date", "session_open_bar", "session_close_bar", "adj_close"]
+    ].drop_duplicates().sort_values("ts_event")
+    if curve.empty:
+        empty = pd.DataFrame(
+            columns=[
+                "ts_event",
+                "session_id",
+                "session_date",
+                "session_open_bar",
+                "session_close_bar",
+                "gc_price_index_equity",
+                "gc_price_index_drawdown_pct",
+            ]
+        )
+        return empty, empty.copy()
+    benchmark = curve.copy().reset_index(drop=True)
+    starting_price = float(benchmark["adj_close"].iloc[0])
+    benchmark["gc_price_index_equity"] = starting_capital * (benchmark["adj_close"] / starting_price)
+    benchmark["gc_price_index_running_peak"] = benchmark["gc_price_index_equity"].cummax()
+    benchmark["gc_price_index_drawdown_pct"] = (
+        benchmark["gc_price_index_equity"] / benchmark["gc_price_index_running_peak"] - 1.0
+    ) * 100.0
+    session_equity = benchmark.loc[benchmark["session_close_bar"]].copy().reset_index(drop=True)
+    return benchmark.reset_index(drop=True), session_equity
+
+
+def _run_session_close_breakout_benchmark(
+    prepared: PreparedData,
+    config: BacktestConfig,
+) -> dict[str, pd.DataFrame | pd.Series]:
+    data = prepared.continuous_data.copy().reset_index(drop=True)
+    sessions = prepared.session_table.copy().reset_index(drop=True)
+    session_lookup = sessions.set_index("session_id")
+    full_session_lookup = prepared.dominant_table.set_index("session_id")
+    trade_records: list[dict[str, Any]] = []
+    event_log: list[dict[str, Any]] = []
+    current_equity = float(config.starting_capital)
+    trade_id_counter = 1
+
+    for session_id, session_bars in data.groupby("session_id", sort=True):
+        session_row = session_lookup.loc[session_id]
+        session_bars = session_bars.reset_index(drop=True)
+        open_bar = session_bars.iloc[0]
+        previous_session_row = None
+        if pd.notna(session_row["previous_session_id"]):
+            previous_session_id = int(session_row["previous_session_id"])
+            if previous_session_id in full_session_lookup.index:
+                previous_session_row = full_session_lookup.loc[previous_session_id]
+        if _prior_session_quality_skip_reason(previous_session_row, config) is not None:
+            continue
+        pending_orders = _initialize_pending_orders(open_bar, config, current_equity)
+        if not pending_orders["active"]:
+            continue
+
+        session_position: PositionState | None = None
+        for _, bar in session_bars.iterrows():
+            if not pending_orders["active"]:
+                break
+            new_positions, _, _, skip_reason, trade_id_counter = _check_entry_triggers(
+                bar=bar,
+                pending_orders=pending_orders,
+                trade_id_counter=trade_id_counter,
+            )
+            if skip_reason is not None:
+                break
+            if new_positions:
+                session_position = new_positions[0]
+                break
+
+        if session_position is None:
+            continue
+
+        exit_bar = session_bars.iloc[-1]
+        session_position.bars_held = max(int(exit_bar["bar_seq"]) - session_position.entry_bar_seq, 0)
+        trade_record, current_equity = _close_position(
+            position=session_position,
+            exit_bar=exit_bar,
+            exit_price=float(exit_bar["close"]),
+            exit_reason="session_close",
+            exit_fill_basis="unadjusted_session_close_exit",
+            current_equity=current_equity,
+        )
+        trade_records.append(trade_record)
+        event_log.append(
+            {
+                "ts_event": trade_record["exit_bar_ts"],
+                "session_id": session_id,
+                "trade_id": trade_record["trade_id"],
+                "event_type": "session_close_exit",
+                "gross_delta": trade_record["incremental_gross_pnl"],
+                "net_delta": trade_record["incremental_net_pnl"],
+                "equity_after_event": current_equity,
+            }
+        )
+
+    trade_log = pd.DataFrame(trade_records)
+    event_log_df = pd.DataFrame(event_log)
+    equity_curve = _build_equity_curve(data, event_log_df, config.starting_capital)
+    session_equity = equity_curve.loc[equity_curve["session_close_bar"]].copy().reset_index(drop=True)
+    empty_frame = pd.DataFrame()
+    performance_summary = _build_performance_summary(
+        trade_log=trade_log,
+        session_equity=session_equity,
+        concurrency_df=empty_frame,
+        floor_events_df=empty_frame,
+        order_cancellations_df=empty_frame,
+        margin_flags_df=empty_frame,
+        session_sizing_df=empty_frame,
+        skipped_sessions_df=empty_frame,
+        config=config,
+    )
+    return {
+        "trade_log": trade_log,
+        "event_log": event_log_df,
+        "equity_curve": equity_curve,
+        "session_equity": session_equity,
+        "performance_summary": performance_summary,
+    }
+
+
+def _summarize_equity_series(
+    label: str,
+    session_equity: pd.DataFrame,
+    equity_column: str,
+    starting_capital: float,
+    risk_free_rate: float,
+    strategy_session_equity: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    if session_equity.empty or equity_column not in session_equity.columns:
+        return {
+            "series": label,
+            "terminal_equity": np.nan,
+            "total_return_pct": np.nan,
+            "annualized_return_pct": np.nan,
+            "max_drawdown_pct": np.nan,
+            "sharpe_ratio": np.nan,
+            "correlation_to_strategy": np.nan,
+        }
+    equity = session_equity[equity_column]
+    total_return = (equity.iloc[-1] / starting_capital) - 1.0
+    years = max((session_equity["ts_event"].iloc[-1] - session_equity["ts_event"].iloc[0]).days / 365.25, 1 / 365.25)
+    annualized_return = np.nan
+    if equity.iloc[-1] > 0 and starting_capital > 0:
+        annualized_return = (equity.iloc[-1] / starting_capital) ** (1 / years) - 1.0
+    returns = equity.pct_change().dropna()
+    rf_session = (1.0 + risk_free_rate) ** (1.0 / 252.0) - 1.0
+    sharpe = _safe_ratio((returns - rf_session).mean(), returns.std(ddof=0)) * np.sqrt(252.0)
+    running_peak = equity.cummax()
+    max_drawdown_pct = abs(((equity / running_peak) - 1.0).min() * 100.0)
+    correlation_to_strategy = np.nan
+    if strategy_session_equity is not None and not strategy_session_equity.empty:
+        strategy_returns = strategy_session_equity[["ts_event", "net_equity"]].copy()
+        strategy_returns["strategy_return"] = strategy_returns["net_equity"].pct_change()
+        series_returns = session_equity[["ts_event", equity_column]].copy()
+        series_returns["series_return"] = series_returns[equity_column].pct_change()
+        aligned = strategy_returns.merge(series_returns, on="ts_event", how="inner").dropna(
+            subset=["strategy_return", "series_return"]
+        )
+        if not aligned.empty:
+            correlation_to_strategy = aligned["series_return"].corr(aligned["strategy_return"])
+    return {
+        "series": label,
+        "terminal_equity": equity.iloc[-1],
+        "total_return_pct": total_return * 100.0,
+        "annualized_return_pct": annualized_return * 100.0,
+        "max_drawdown_pct": max_drawdown_pct,
+        "sharpe_ratio": sharpe,
+        "correlation_to_strategy": correlation_to_strategy,
+    }
+
+
+def _build_benchmark_summary(
+    strategy_session_equity: pd.DataFrame,
+    gc_price_session_equity: pd.DataFrame,
+    breakout_baseline_session_equity: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    rows = [
+        _summarize_equity_series(
+            label="Strategy Net Equity",
+            session_equity=strategy_session_equity,
+            equity_column="net_equity",
+            starting_capital=config.starting_capital,
+            risk_free_rate=config.risk_free_rate,
+            strategy_session_equity=strategy_session_equity,
+        ),
+        _summarize_equity_series(
+            label="GC Price Index",
+            session_equity=gc_price_session_equity,
+            equity_column="gc_price_index_equity",
+            starting_capital=config.starting_capital,
+            risk_free_rate=config.risk_free_rate,
+            strategy_session_equity=strategy_session_equity,
+        ),
+        _summarize_equity_series(
+            label="Breakout Session-Close Baseline",
+            session_equity=breakout_baseline_session_equity,
+            equity_column="net_equity",
+            starting_capital=config.starting_capital,
+            risk_free_rate=config.risk_free_rate,
+            strategy_session_equity=strategy_session_equity,
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
 def _build_performance_summary(
     trade_log: pd.DataFrame,
     session_equity: pd.DataFrame,
@@ -1754,12 +1967,57 @@ def _finalize_backtest_results(
     direction_summary = _build_direction_summary(trade_log)
     annual_summary = _build_annual_summary(session_equity, trade_log)
     exit_breakdown = _build_exit_breakdown(trade_log)
+    gc_price_curve, gc_price_session_equity = _build_normalized_gc_price_benchmark(
+        data=data,
+        starting_capital=config.starting_capital,
+    )
+    breakout_baseline = _run_session_close_breakout_benchmark(prepared, config)
+    benchmark_curves = equity_curve[
+        ["ts_event", "session_id", "session_date", "session_open_bar", "session_close_bar"]
+    ].copy()
+    if not gc_price_curve.empty:
+        benchmark_curves = benchmark_curves.merge(
+            gc_price_curve[
+                [
+                    "ts_event",
+                    "gc_price_index_equity",
+                    "gc_price_index_drawdown_pct",
+                ]
+            ],
+            on="ts_event",
+            how="left",
+        )
+    if not breakout_baseline["equity_curve"].empty:
+        benchmark_curves = benchmark_curves.merge(
+            breakout_baseline["equity_curve"][
+                [
+                    "ts_event",
+                    "net_equity",
+                    "net_drawdown_pct",
+                ]
+            ].rename(
+                columns={
+                    "net_equity": "breakout_baseline_net_equity",
+                    "net_drawdown_pct": "breakout_baseline_net_drawdown_pct",
+                }
+            ),
+            on="ts_event",
+            how="left",
+        )
+    benchmark_summary = _build_benchmark_summary(
+        strategy_session_equity=session_equity,
+        gc_price_session_equity=gc_price_session_equity,
+        breakout_baseline_session_equity=breakout_baseline["session_equity"],
+        config=config,
+    )
     diagnostics = {
         "concurrency_log": concurrency_df,
         "session_sizing": session_sizing_df,
         "sessions_with_concurrent_long_short": sorted(session_concurrent_long_short),
         "peak_concurrent_positions": int(concurrency_df["open_positions"].max()) if not concurrency_df.empty else 0,
         "peak_concurrent_contracts": int(concurrency_df["open_contracts"].max()) if not concurrency_df.empty else 0,
+        "breakout_baseline_trade_log": breakout_baseline["trade_log"],
+        "breakout_baseline_performance_summary": breakout_baseline["performance_summary"],
     }
     validation_results = run_validations(
         prepared=prepared,
@@ -1791,6 +2049,8 @@ def _finalize_backtest_results(
         direction_summary=direction_summary,
         annual_summary=annual_summary,
         exit_breakdown=exit_breakdown,
+        benchmark_curves=benchmark_curves.reset_index(drop=True),
+        benchmark_summary=benchmark_summary,
         validation_results=validation_results,
         diagnostics=diagnostics,
     )
@@ -2428,13 +2688,42 @@ def run_validations(
 
 def plot_equity_curve(result: BacktestResult) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(result.equity_curve["ts_event"], result.equity_curve["gross_equity"], label="Gross equity")
-    ax.plot(result.equity_curve["ts_event"], result.equity_curve["net_equity"], label="Net equity")
+    ax.plot(
+        result.equity_curve["ts_event"],
+        result.equity_curve["gross_equity"],
+        label="Strategy gross equity",
+        color="lightsteelblue",
+        linewidth=1.0,
+    )
+    ax.plot(
+        result.equity_curve["ts_event"],
+        result.equity_curve["net_equity"],
+        label="Strategy net equity",
+        color="navy",
+        linewidth=1.6,
+    )
+    if not result.benchmark_curves.empty and "gc_price_index_equity" in result.benchmark_curves.columns:
+        ax.plot(
+            result.benchmark_curves["ts_event"],
+            result.benchmark_curves["gc_price_index_equity"],
+            label="GC price index",
+            color="darkgreen",
+            linewidth=1.2,
+        )
+    if not result.benchmark_curves.empty and "breakout_baseline_net_equity" in result.benchmark_curves.columns:
+        ax.plot(
+            result.benchmark_curves["ts_event"],
+            result.benchmark_curves["breakout_baseline_net_equity"],
+            label="Breakout baseline",
+            color="darkorange",
+            linewidth=1.2,
+            linestyle="--",
+        )
     if not result.roll_events.empty:
         for roll_ts in pd.to_datetime(result.roll_events["roll_ts"], utc=True):
             ax.axvline(roll_ts, color="grey", alpha=0.15, linewidth=0.8)
     ax.set_yscale("log")
-    ax.set_title("Equity Curve")
+    ax.set_title("Equity Curve vs Benchmarks")
     ax.set_ylabel("Equity")
     ax.legend()
     ax.grid(True, alpha=0.2)
@@ -2444,9 +2733,30 @@ def plot_equity_curve(result: BacktestResult) -> plt.Figure:
 
 def plot_drawdown_curve(result: BacktestResult) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(result.equity_curve["ts_event"], result.equity_curve["net_drawdown_pct"], color="firebrick")
-    ax.set_title("Net Drawdown")
+    ax.plot(
+        result.equity_curve["ts_event"],
+        result.equity_curve["net_drawdown_pct"],
+        color="firebrick",
+        label="Strategy net drawdown",
+    )
+    if not result.benchmark_curves.empty and "gc_price_index_drawdown_pct" in result.benchmark_curves.columns:
+        ax.plot(
+            result.benchmark_curves["ts_event"],
+            result.benchmark_curves["gc_price_index_drawdown_pct"],
+            color="darkgreen",
+            label="GC price index drawdown",
+        )
+    if not result.benchmark_curves.empty and "breakout_baseline_net_drawdown_pct" in result.benchmark_curves.columns:
+        ax.plot(
+            result.benchmark_curves["ts_event"],
+            result.benchmark_curves["breakout_baseline_net_drawdown_pct"],
+            color="darkorange",
+            linestyle="--",
+            label="Breakout baseline drawdown",
+        )
+    ax.set_title("Net Drawdown vs Benchmarks")
     ax.set_ylabel("Drawdown %")
+    ax.legend()
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     return fig
