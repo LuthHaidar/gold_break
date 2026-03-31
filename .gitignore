@@ -4,5 +4,4 @@
 !gold_breakout_backtest.py
 !gold_breakout_intrabar_recent.py
 !gold_breakout_intrabar_recent.ipynb
-!build_gold_breakout_intrabar_recent_notebook.py
 # Ignore all other files
