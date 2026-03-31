@@ -801,13 +801,23 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
                 open_positions = [pos for pos in open_positions if pos.trade_id not in closed_ids]
 
             if pending_orders["active"]:
-                new_positions, floor_rows, trade_id_counter = _check_entry_triggers(
+                new_positions, floor_rows, cancellation_rows, skip_reason, trade_id_counter = _check_entry_triggers(
                     bar=bar,
                     pending_orders=pending_orders,
                     trade_id_counter=trade_id_counter,
                 )
                 open_positions.extend(new_positions)
                 floor_events.extend(floor_rows)
+                order_cancellations.extend(cancellation_rows)
+                if skip_reason is not None:
+                    skipped_sessions.append(
+                        {
+                            "session_id": session_id,
+                            "session_date": session_row["session_date"],
+                            "ts_event": bar["ts_event"],
+                            "reason": skip_reason,
+                        }
+                    )
 
             concurrency_snapshot = _capture_concurrency_snapshot(
                 ts_event=bar["ts_event"],
@@ -957,60 +967,94 @@ def _check_entry_triggers(
     bar: pd.Series,
     pending_orders: dict[str, Any],
     trade_id_counter: int,
-) -> tuple[list[PositionState], list[dict[str, Any]], int]:
+) -> tuple[list[PositionState], list[dict[str, Any]], list[dict[str, Any]], str | None, int]:
     new_positions: list[PositionState] = []
     floor_rows: list[dict[str, Any]] = []
+    order_cancellations: list[dict[str, Any]] = []
+    skip_reason: str | None = None
     adj_factor = float(bar["adj_factor"])
     long_trade: PositionState | None = None
     short_trade: PositionState | None = None
 
-    if not pending_orders["long_triggered"]:
-        buy_stop_unadjusted = pending_orders["buy_stop_adj"] - adj_factor
-        if float(bar["open"]) > buy_stop_unadjusted:
-            entry_price = float(bar["open"])
-            entry_basis = "unadjusted_open_gap_entry"
-        elif float(bar["adj_high"]) >= pending_orders["buy_stop_adj"]:
-            entry_price = buy_stop_unadjusted + TICK_SIZE
-            entry_basis = "unadjusted_stop_plus_tick_entry"
-        else:
-            entry_price = None
-            entry_basis = ""
-        if entry_price is not None:
-            long_trade = _open_position(
-                trade_id=trade_id_counter,
-                direction="long",
-                bar=bar,
-                entry_price=float(entry_price),
-                entry_fill_basis=entry_basis,
-                pending_orders=pending_orders,
-            )
-            trade_id_counter += 1
-            pending_orders["long_triggered"] = True
-            new_positions.append(long_trade)
+    buy_stop_unadjusted = pending_orders["buy_stop_adj"] - adj_factor
+    sell_stop_unadjusted = pending_orders["sell_stop_adj"] - adj_factor
+    long_gap_trigger = float(bar["open"]) > buy_stop_unadjusted
+    short_gap_trigger = float(bar["open"]) < sell_stop_unadjusted
+    long_bar_trigger = float(bar["adj_high"]) >= pending_orders["buy_stop_adj"]
+    short_bar_trigger = float(bar["adj_low"]) <= pending_orders["sell_stop_adj"]
 
-    if not pending_orders["short_triggered"]:
-        sell_stop_unadjusted = pending_orders["sell_stop_adj"] - adj_factor
-        if float(bar["open"]) < sell_stop_unadjusted:
-            entry_price = float(bar["open"])
-            entry_basis = "unadjusted_open_gap_entry"
-        elif float(bar["adj_low"]) <= pending_orders["sell_stop_adj"]:
-            entry_price = sell_stop_unadjusted - TICK_SIZE
-            entry_basis = "unadjusted_stop_minus_tick_entry"
-        else:
-            entry_price = None
-            entry_basis = ""
-        if entry_price is not None:
-            short_trade = _open_position(
-                trade_id=trade_id_counter,
-                direction="short",
-                bar=bar,
-                entry_price=float(entry_price),
-                entry_fill_basis=entry_basis,
-                pending_orders=pending_orders,
-            )
-            trade_id_counter += 1
-            pending_orders["short_triggered"] = True
-            new_positions.append(short_trade)
+    def _cancellation_row(direction: str, reason: str) -> dict[str, Any]:
+        stop_level = pending_orders["buy_stop_adj"] if direction == "long" else pending_orders["sell_stop_adj"]
+        return {
+            "session_id": pending_orders["session_id"],
+            "session_date": pending_orders["session_date"],
+            "direction": direction,
+            "cancel_ts": bar["ts_event"],
+            "stop_level_adj": stop_level,
+            "cancel_reason": reason,
+        }
+
+    if long_gap_trigger:
+        long_trade = _open_position(
+            trade_id=trade_id_counter,
+            direction="long",
+            bar=bar,
+            entry_price=float(bar["open"]),
+            entry_fill_basis="unadjusted_open_gap_entry",
+            pending_orders=pending_orders,
+        )
+        trade_id_counter += 1
+        pending_orders["long_triggered"] = True
+        pending_orders["active"] = False
+        new_positions.append(long_trade)
+        order_cancellations.append(_cancellation_row("short", "oco_after_long_fill"))
+    elif short_gap_trigger:
+        short_trade = _open_position(
+            trade_id=trade_id_counter,
+            direction="short",
+            bar=bar,
+            entry_price=float(bar["open"]),
+            entry_fill_basis="unadjusted_open_gap_entry",
+            pending_orders=pending_orders,
+        )
+        trade_id_counter += 1
+        pending_orders["short_triggered"] = True
+        pending_orders["active"] = False
+        new_positions.append(short_trade)
+        order_cancellations.append(_cancellation_row("long", "oco_after_short_fill"))
+    elif long_bar_trigger and short_bar_trigger:
+        pending_orders["active"] = False
+        skip_reason = "Ambiguous hourly OCO trigger: both entry stops touched in the same bar."
+        order_cancellations.append(_cancellation_row("long", "ambiguous_oco_skip"))
+        order_cancellations.append(_cancellation_row("short", "ambiguous_oco_skip"))
+    elif long_bar_trigger:
+        long_trade = _open_position(
+            trade_id=trade_id_counter,
+            direction="long",
+            bar=bar,
+            entry_price=buy_stop_unadjusted + TICK_SIZE,
+            entry_fill_basis="unadjusted_stop_plus_tick_entry",
+            pending_orders=pending_orders,
+        )
+        trade_id_counter += 1
+        pending_orders["long_triggered"] = True
+        pending_orders["active"] = False
+        new_positions.append(long_trade)
+        order_cancellations.append(_cancellation_row("short", "oco_after_long_fill"))
+    elif short_bar_trigger:
+        short_trade = _open_position(
+            trade_id=trade_id_counter,
+            direction="short",
+            bar=bar,
+            entry_price=sell_stop_unadjusted - TICK_SIZE,
+            entry_fill_basis="unadjusted_stop_minus_tick_entry",
+            pending_orders=pending_orders,
+        )
+        trade_id_counter += 1
+        pending_orders["short_triggered"] = True
+        pending_orders["active"] = False
+        new_positions.append(short_trade)
+        order_cancellations.append(_cancellation_row("long", "oco_after_short_fill"))
 
     for trade in [long_trade, short_trade]:
         if trade is not None and trade.floor_applied:
@@ -1025,7 +1069,7 @@ def _check_entry_triggers(
                     "sl_distance_usd": trade.sl_distance_usd,
                 }
             )
-    return new_positions, floor_rows, trade_id_counter
+    return new_positions, floor_rows, order_cancellations, skip_reason, trade_id_counter
 
 
 def _open_position(
@@ -1270,6 +1314,7 @@ def _build_performance_summary(
     floor_events_df: pd.DataFrame,
     order_cancellations_df: pd.DataFrame,
     margin_flags_df: pd.DataFrame,
+    skipped_sessions_df: pd.DataFrame,
     config: BacktestConfig,
 ) -> pd.Series:
     if session_equity.empty:
@@ -1307,6 +1352,11 @@ def _build_performance_summary(
     net_total_pnl = trade_log["net_pnl"].sum() if not trade_log.empty else 0.0
     cost_drag = gross_total_pnl - net_total_pnl
     cost_drag_pct = _safe_ratio(cost_drag, gross_total_pnl) * 100.0 if gross_total_pnl != 0 else np.nan
+    ambiguous_entry_skips = 0
+    if not skipped_sessions_df.empty and "reason" in skipped_sessions_df.columns:
+        ambiguous_entry_skips = int(
+            skipped_sessions_df["reason"].fillna("").str.startswith("Ambiguous hourly OCO trigger").sum()
+        )
     return pd.Series(
         {
             "terminal_gross_equity": gross_equity.iloc[-1],
@@ -1340,6 +1390,7 @@ def _build_performance_summary(
             "cost_drag_pct_of_gross": cost_drag_pct,
             "cancelled_orders": int(order_cancellations_df.shape[0]),
             "margin_flag_sessions": int(margin_flags_df.shape[0]),
+            "ambiguous_entry_skip_sessions": ambiguous_entry_skips,
         }
     )
 
@@ -1432,6 +1483,7 @@ def _finalize_backtest_results(
         floor_events_df=floor_events_df,
         order_cancellations_df=order_cancellations_df,
         margin_flags_df=margin_flags_df,
+        skipped_sessions_df=skipped_sessions_df,
         config=config,
     )
     direction_summary = _build_direction_summary(trade_log)
@@ -1665,6 +1717,18 @@ def run_validations(
             "test": "Minimum floor logging",
             "status": "pass" if floor_logging_ok else "fail",
             "detail": "Every trade that used the one-contract floor appears in the floor-event log.",
+        }
+    )
+
+    oco_same_bar_ok = True
+    if not trade_log.empty:
+        same_bar_direction_counts = trade_log.groupby(["entry_session_id", "entry_bar_ts"])["direction"].nunique()
+        oco_same_bar_ok = bool((same_bar_direction_counts <= 1).all())
+    validations.append(
+        {
+            "test": "OCO same-bar enforcement",
+            "status": "pass" if oco_same_bar_ok else "fail",
+            "detail": "No session bar creates simultaneous long and short entries under the hourly OCO rule.",
         }
     )
     return pd.DataFrame(validations)
