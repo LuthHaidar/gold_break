@@ -48,11 +48,13 @@ class BacktestConfig:
     risk_fraction: float = 0.01
     initial_margin_per_contract: float = 15_000.0
     max_margin_fraction: float = 0.50
+    max_contracts: int = 3
     sensitivity_atr_periods: tuple[int, ...] = (7, 14, 21)
     sensitivity_atr_multipliers: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0)
     sensitivity_ks: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00)
     sensitivity_tp_sl_modes: tuple[str, ...] = VALID_TP_SL_MODES
     sensitivity_risk_fractions: tuple[float, ...] = (0.005, 0.01, 0.02)
+    sensitivity_max_contracts: tuple[int, ...] = (1, 2, 3, 5, 10)
 
     def resolved_start_session_date(self) -> pd.Timestamp:
         return pd.Timestamp(self.backtest_start_session_date, tz="UTC").normalize()
@@ -166,6 +168,10 @@ def _validate_config(config: BacktestConfig) -> None:
         raise ValueError("initial_margin_per_contract must be positive.")
     if config.max_margin_fraction <= 0 or config.max_margin_fraction > 1:
         raise ValueError("max_margin_fraction must be in the interval (0, 1].")
+    if config.max_contracts <= 0:
+        raise ValueError("max_contracts must be positive.")
+    if any(limit <= 0 for limit in config.sensitivity_max_contracts):
+        raise ValueError("All sensitivity_max_contracts values must be positive.")
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -203,6 +209,7 @@ def _position_size(
     risk_fraction: float,
     initial_margin_per_contract: float,
     max_margin_fraction: float,
+    max_contracts: int,
 ) -> dict[str, Any]:
     risk_per_trade = current_equity * risk_fraction
     sl_distance_ticks = sl_distance_price / TICK_SIZE
@@ -215,9 +222,11 @@ def _position_size(
         if initial_margin_per_contract > 0
         else 0
     )
-    contracts = min(floor_contracts, margin_allowed_contracts) if margin_allowed_contracts >= 1 else 0
-    margin_cap_applied = margin_allowed_contracts >= 1 and contracts < floor_contracts
+    pre_contract_cap_contracts = min(floor_contracts, margin_allowed_contracts) if margin_allowed_contracts >= 1 else 0
+    contracts = min(pre_contract_cap_contracts, max_contracts) if pre_contract_cap_contracts >= 1 else 0
+    margin_cap_applied = margin_allowed_contracts >= 1 and pre_contract_cap_contracts < floor_contracts
     margin_cap_blocked = margin_allowed_contracts < 1
+    contract_cap_applied = pre_contract_cap_contracts >= 1 and contracts < pre_contract_cap_contracts
     return {
         "risk_per_trade": risk_per_trade,
         "sl_distance_usd": sl_distance_usd,
@@ -232,6 +241,8 @@ def _position_size(
         "selected_initial_margin": contracts * initial_margin_per_contract,
         "margin_cap_applied": margin_cap_applied,
         "margin_cap_blocked": margin_cap_blocked,
+        "max_contracts": max_contracts,
+        "contract_cap_applied": contract_cap_applied,
     }
 
 
@@ -800,6 +811,8 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
                     "margin_allowed_contracts": pending_orders["margin_allowed_contracts"],
                     "floor_applied": pending_orders["floor_applied"],
                     "margin_cap_applied": pending_orders["margin_cap_applied"],
+                    "max_contracts": pending_orders["max_contracts"],
+                    "contract_cap_applied": pending_orders["contract_cap_applied"],
                     "sl_distance_price": pending_orders["sl_distance_price"],
                     "sl_distance_usd": pending_orders["sl_distance_usd"],
                     "allowed_initial_margin": pending_orders["allowed_initial_margin"],
@@ -1022,6 +1035,7 @@ def _initialize_pending_orders(open_bar: pd.Series, config: BacktestConfig, sess
         config.risk_fraction,
         config.initial_margin_per_contract,
         config.max_margin_fraction,
+        config.max_contracts,
     )
     if sizing["margin_cap_blocked"]:
         return {
@@ -1034,6 +1048,9 @@ def _initialize_pending_orders(open_bar: pd.Series, config: BacktestConfig, sess
             "margin_allowed_contracts": sizing["margin_allowed_contracts"],
             "allowed_initial_margin": sizing["allowed_initial_margin"],
             "required_initial_margin": sizing["required_initial_margin"],
+            "max_contracts": sizing["max_contracts"],
+            "selected_initial_margin": sizing["selected_initial_margin"],
+            "contract_cap_applied": sizing["contract_cap_applied"],
         }
     return {
         "active": True,
@@ -1056,6 +1073,8 @@ def _initialize_pending_orders(open_bar: pd.Series, config: BacktestConfig, sess
         "required_initial_margin": sizing["required_initial_margin"],
         "selected_initial_margin": sizing["selected_initial_margin"],
         "margin_cap_applied": sizing["margin_cap_applied"],
+        "max_contracts": sizing["max_contracts"],
+        "contract_cap_applied": sizing["contract_cap_applied"],
         "sizing_equity": session_open_equity,
         "long_triggered": False,
         "short_triggered": False,
@@ -1414,6 +1433,7 @@ def _build_performance_summary(
     floor_events_df: pd.DataFrame,
     order_cancellations_df: pd.DataFrame,
     margin_flags_df: pd.DataFrame,
+    session_sizing_df: pd.DataFrame,
     skipped_sessions_df: pd.DataFrame,
     config: BacktestConfig,
 ) -> pd.Series:
@@ -1456,6 +1476,7 @@ def _build_performance_summary(
     carry_position_skips = 0
     margin_cap_applied_sessions = 0
     margin_cap_blocked_sessions = 0
+    max_contract_cap_applied_sessions = 0
     if not skipped_sessions_df.empty and "reason" in skipped_sessions_df.columns:
         ambiguous_entry_skips = int(
             skipped_sessions_df["reason"].fillna("").str.startswith("Ambiguous hourly OCO trigger").sum()
@@ -1470,6 +1491,8 @@ def _build_performance_summary(
         margin_cap_blocked_sessions = int(
             margin_flags_df["flag_type"].eq("margin_cap_blocked").sum()
         )
+    if not session_sizing_df.empty and "contract_cap_applied" in session_sizing_df.columns:
+        max_contract_cap_applied_sessions = int(session_sizing_df["contract_cap_applied"].sum())
     return pd.Series(
         {
             "terminal_gross_equity": gross_equity.iloc[-1],
@@ -1505,6 +1528,7 @@ def _build_performance_summary(
             "margin_flag_sessions": int(margin_flags_df.shape[0]),
             "margin_cap_applied_sessions": margin_cap_applied_sessions,
             "margin_cap_blocked_sessions": margin_cap_blocked_sessions,
+            "max_contract_cap_applied_sessions": max_contract_cap_applied_sessions,
             "ambiguous_entry_skip_sessions": ambiguous_entry_skips,
             "carry_position_skip_sessions": carry_position_skips,
         }
@@ -1599,6 +1623,7 @@ def _finalize_backtest_results(
         floor_events_df=floor_events_df,
         order_cancellations_df=order_cancellations_df,
         margin_flags_df=margin_flags_df,
+        session_sizing_df=session_sizing_df,
         skipped_sessions_df=skipped_sessions_df,
         config=config,
     )
@@ -1703,9 +1728,26 @@ def run_sensitivity_analysis(prepared: PreparedData, config: BacktestConfig) -> 
                 "total_trades": metrics["total_trades"],
             }
         )
+    contract_cap_rows: list[dict[str, Any]] = []
+    for max_contracts in config.sensitivity_max_contracts:
+        run_config = replace(config, max_contracts=max_contracts)
+        result = run_backtest(default_atr_prepared, run_config)
+        metrics = result.performance_summary
+        contract_cap_rows.append(
+            {
+                "max_contracts": max_contracts,
+                "terminal_net_equity": metrics["terminal_net_equity"],
+                "max_drawdown_pct": metrics["max_drawdown_pct"],
+                "sharpe_ratio": metrics["sharpe_ratio"],
+                "total_return_pct": metrics["total_return_pct"],
+                "total_trades": metrics["total_trades"],
+                "max_contract_cap_applied_sessions": metrics["max_contract_cap_applied_sessions"],
+            }
+        )
     return {
         "primary_grid": pd.DataFrame(grid_rows),
         "sizing_grid": pd.DataFrame(sizing_rows),
+        "contract_cap_grid": pd.DataFrame(contract_cap_rows),
     }
 
 
@@ -1854,6 +1896,17 @@ def run_validations(
             "test": "Margin cap enforcement",
             "status": "pass" if margin_cap_ok else "fail",
             "detail": "Each trade's initial margin fits within the configured margin-fraction cap.",
+        }
+    )
+
+    max_contract_cap_ok = True
+    if not trade_log.empty:
+        max_contract_cap_ok = bool((trade_log["contracts"] <= config.max_contracts).all())
+    validations.append(
+        {
+            "test": "Max contract cap enforcement",
+            "status": "pass" if max_contract_cap_ok else "fail",
+            "detail": "Each trade's contracts do not exceed the configured hard contract cap.",
         }
     )
 
@@ -2034,6 +2087,21 @@ def plot_sizing_sensitivity_curve(sizing_grid: pd.DataFrame) -> plt.Figure:
     ax2.plot(subset["risk_fraction"], subset["max_drawdown_pct"], marker="s", color="firebrick", label="Max DD %")
     ax1.set_title("Sizing Sensitivity")
     ax1.set_xlabel("Risk fraction")
+    ax1.set_ylabel("Terminal net equity")
+    ax2.set_ylabel("Max drawdown %")
+    ax1.grid(True, alpha=0.2)
+    fig.tight_layout()
+    return fig
+
+
+def plot_max_contracts_sensitivity_curve(contract_cap_grid: pd.DataFrame) -> plt.Figure:
+    subset = contract_cap_grid.sort_values("max_contracts")
+    fig, ax1 = plt.subplots(figsize=(10, 4))
+    ax2 = ax1.twinx()
+    ax1.plot(subset["max_contracts"], subset["terminal_net_equity"], marker="o", label="Terminal net equity")
+    ax2.plot(subset["max_contracts"], subset["max_drawdown_pct"], marker="s", color="firebrick", label="Max DD %")
+    ax1.set_title("Max Contracts Sensitivity")
+    ax1.set_xlabel("Max contracts")
     ax1.set_ylabel("Terminal net equity")
     ax2.set_ylabel("Max drawdown %")
     ax1.grid(True, alpha=0.2)
