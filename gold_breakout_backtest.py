@@ -701,10 +701,34 @@ def _filter_backtest_window(
     return filtered_sessions, filtered_continuous
 
 
+def _prior_session_quality_skip_reason(
+    previous_session_row: pd.Series | None,
+    config: BacktestConfig,
+) -> str | None:
+    if previous_session_row is None:
+        return None
+    quality_failures: list[str] = []
+    if not bool(previous_session_row["complete_session"]):
+        quality_failures.append(
+            f"incomplete previous session ({int(previous_session_row['continuous_session_bars'])} bars)"
+        )
+    if (
+        config.min_session_volume > 0
+        and float(previous_session_row["session_total_volume"]) < float(config.min_session_volume)
+    ):
+        quality_failures.append(
+            "previous session volume below configured threshold"
+        )
+    if not quality_failures:
+        return None
+    return f"Previous session failed quality filter: {', '.join(quality_failures)}."
+
+
 def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResult:
     data = prepared.continuous_data.copy().reset_index(drop=True)
     sessions = prepared.session_table.copy().reset_index(drop=True)
     session_lookup = sessions.set_index("session_id")
+    full_session_lookup = prepared.dominant_table.set_index("session_id")
     open_positions: list[PositionState] = []
     trade_records: list[dict[str, Any]] = []
     roll_events: list[dict[str, Any]] = []
@@ -797,7 +821,20 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
                 "skip_reason_code": "carry_position",
             }
         else:
-            pending_orders = _initialize_pending_orders(open_bar, config, session_open_equity)
+            previous_session_row = None
+            if pd.notna(session_row["previous_session_id"]):
+                previous_session_id = int(session_row["previous_session_id"])
+                if previous_session_id in full_session_lookup.index:
+                    previous_session_row = full_session_lookup.loc[previous_session_id]
+            prior_session_quality_skip_reason = _prior_session_quality_skip_reason(previous_session_row, config)
+            if prior_session_quality_skip_reason is not None:
+                pending_orders = {
+                    "active": False,
+                    "skip_reason": prior_session_quality_skip_reason,
+                    "skip_reason_code": "prior_session_quality",
+                }
+            else:
+                pending_orders = _initialize_pending_orders(open_bar, config, session_open_equity)
         if pending_orders["active"]:
             session_sizing_log.append(
                 {
@@ -1474,6 +1511,7 @@ def _build_performance_summary(
     cost_drag_pct = _safe_ratio(cost_drag, gross_total_pnl) * 100.0 if gross_total_pnl != 0 else np.nan
     ambiguous_entry_skips = 0
     carry_position_skips = 0
+    prior_session_quality_skips = 0
     margin_cap_applied_sessions = 0
     margin_cap_blocked_sessions = 0
     max_contract_cap_applied_sessions = 0
@@ -1483,6 +1521,9 @@ def _build_performance_summary(
         )
         carry_position_skips = int(
             skipped_sessions_df["reason"].fillna("").eq("Open position carried into session; new session orders suppressed.").sum()
+        )
+        prior_session_quality_skips = int(
+            skipped_sessions_df["reason"].fillna("").str.startswith("Previous session failed quality filter:").sum()
         )
     if not margin_flags_df.empty and "flag_type" in margin_flags_df.columns:
         margin_cap_applied_sessions = int(
@@ -1531,6 +1572,7 @@ def _build_performance_summary(
             "max_contract_cap_applied_sessions": max_contract_cap_applied_sessions,
             "ambiguous_entry_skip_sessions": ambiguous_entry_skips,
             "carry_position_skip_sessions": carry_position_skips,
+            "prior_session_quality_skip_sessions": prior_session_quality_skips,
         }
     )
 
@@ -1951,6 +1993,25 @@ def run_validations(
             "test": "Carry-position session suppression",
             "status": "pass" if carry_position_skip_ok else "fail",
             "detail": "Sessions skipped because a position was already open do not create new entries.",
+        }
+    )
+
+    prior_session_quality_skip_ok = True
+    if not skipped_sessions.empty and not trade_log.empty and "reason" in skipped_sessions.columns:
+        prior_quality_skip_sessions = set(
+            skipped_sessions.loc[
+                skipped_sessions["reason"].fillna("").str.startswith("Previous session failed quality filter:"),
+                "session_id",
+            ].tolist()
+        )
+        prior_session_quality_skip_ok = bool(
+            trade_log.loc[trade_log["entry_session_id"].isin(prior_quality_skip_sessions)].empty
+        )
+    validations.append(
+        {
+            "test": "Prior-session quality suppression",
+            "status": "pass" if prior_session_quality_skip_ok else "fail",
+            "detail": "Sessions skipped because the previous session was incomplete or abnormal do not create new entries.",
         }
     )
     return pd.DataFrame(validations)
