@@ -22,6 +22,7 @@ EXPECTED_COLUMNS = [
     "symbol",
 ]
 VALID_TP_SL_MODES = ("symmetric_fixed", "atr_based", "prior_day_range")
+VALID_WALK_FORWARD_OBJECTIVES = ("sharpe_ratio", "total_return_pct", "calmar_ratio")
 TICK_SIZE = 0.10
 TICK_VALUE = 10.00
 CONTRACT_MULTIPLIER = 100.0
@@ -55,6 +56,14 @@ class BacktestConfig:
     sensitivity_tp_sl_modes: tuple[str, ...] = VALID_TP_SL_MODES
     sensitivity_risk_fractions: tuple[float, ...] = (0.005, 0.01, 0.02)
     sensitivity_max_contracts: tuple[int, ...] = (1, 2, 3, 5, 10)
+    walk_forward_train_years: int = 3
+    walk_forward_test_years: int = 1
+    walk_forward_step_months: int = 12
+    walk_forward_objective: str = "sharpe_ratio"
+    walk_forward_atr_periods: tuple[int, ...] = (14,)
+    walk_forward_tp_sl_modes: tuple[str, ...] = ("prior_day_range",)
+    walk_forward_atr_multipliers: tuple[float, ...] = (1.0, 1.5, 2.0)
+    walk_forward_ks: tuple[float, ...] = (0.25, 0.50, 0.75)
 
     def resolved_start_session_date(self) -> pd.Timestamp:
         return pd.Timestamp(self.backtest_start_session_date, tz="UTC").normalize()
@@ -135,6 +144,18 @@ class BacktestResult:
     diagnostics: dict[str, Any]
 
 
+@dataclass
+class WalkForwardResult:
+    config: BacktestConfig
+    fold_summary: pd.DataFrame
+    optimization_results: pd.DataFrame
+    parameter_stability: pd.DataFrame
+    oos_equity_curve: pd.DataFrame
+    oos_session_equity: pd.DataFrame
+    oos_trade_log: pd.DataFrame
+    diagnostics: dict[str, Any]
+
+
 def make_default_config(**overrides: Any) -> BacktestConfig:
     base = BacktestConfig()
     return replace(base, **overrides)
@@ -154,6 +175,8 @@ def summarize_audit(audit: dict[str, Any]) -> pd.DataFrame:
 def _validate_config(config: BacktestConfig) -> None:
     if config.tp_sl_mode not in VALID_TP_SL_MODES:
         raise ValueError(f"Unsupported tp_sl_mode: {config.tp_sl_mode}")
+    if config.walk_forward_objective not in VALID_WALK_FORWARD_OBJECTIVES:
+        raise ValueError(f"Unsupported walk_forward_objective: {config.walk_forward_objective}")
     if config.fixed_ticks <= 0:
         raise ValueError("fixed_ticks must be positive.")
     if config.atr_period <= 0:
@@ -174,6 +197,22 @@ def _validate_config(config: BacktestConfig) -> None:
         raise ValueError("max_contracts must be positive.")
     if any(limit <= 0 for limit in config.sensitivity_max_contracts):
         raise ValueError("All sensitivity_max_contracts values must be positive.")
+    if config.walk_forward_train_years <= 0:
+        raise ValueError("walk_forward_train_years must be positive.")
+    if config.walk_forward_test_years <= 0:
+        raise ValueError("walk_forward_test_years must be positive.")
+    if config.walk_forward_step_months <= 0:
+        raise ValueError("walk_forward_step_months must be positive.")
+    if config.walk_forward_step_months < config.walk_forward_test_years * 12:
+        raise ValueError("walk_forward_step_months must be at least the walk-forward test horizon in months.")
+    if any(period <= 0 for period in config.walk_forward_atr_periods):
+        raise ValueError("All walk_forward_atr_periods values must be positive.")
+    if any(multiplier <= 0 for multiplier in config.walk_forward_atr_multipliers):
+        raise ValueError("All walk_forward_atr_multipliers values must be positive.")
+    if any(k <= 0 for k in config.walk_forward_ks):
+        raise ValueError("All walk_forward_ks values must be positive.")
+    if any(mode not in VALID_TP_SL_MODES for mode in config.walk_forward_tp_sl_modes):
+        raise ValueError("walk_forward_tp_sl_modes contains an unsupported mode.")
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -1834,6 +1873,317 @@ def run_sensitivity_analysis(prepared: PreparedData, config: BacktestConfig) -> 
         "sizing_grid": pd.DataFrame(sizing_rows),
         "contract_cap_grid": pd.DataFrame(contract_cap_rows),
     }
+
+
+def _subset_prepared_by_session_date_range(
+    prepared: PreparedData,
+    start_session_date: pd.Timestamp,
+    end_session_date: pd.Timestamp,
+) -> PreparedData:
+    session_mask = prepared.session_table["session_date"].ge(start_session_date) & prepared.session_table[
+        "session_date"
+    ].lt(end_session_date)
+    subset_sessions = prepared.session_table.loc[session_mask].copy()
+    subset_ids = subset_sessions["session_id"].tolist()
+    subset_data = prepared.continuous_data.loc[prepared.continuous_data["session_id"].isin(subset_ids)].copy()
+    return PreparedData(
+        clean_data=prepared.clean_data,
+        session_table=subset_sessions.reset_index(drop=True),
+        dominant_table=prepared.dominant_table,
+        continuous_data=subset_data.reset_index(drop=True),
+        atr_source_data=prepared.atr_source_data,
+        audit=prepared.audit,
+        notes=prepared.notes,
+    )
+
+
+def _build_walk_forward_windows(config: BacktestConfig, session_table: pd.DataFrame) -> pd.DataFrame:
+    if session_table.empty:
+        return pd.DataFrame()
+    unique_dates = (
+        session_table["session_date"].drop_duplicates().sort_values().reset_index(drop=True)
+    )
+    first_session_date = pd.Timestamp(unique_dates.iloc[0])
+    last_session_date_exclusive = pd.Timestamp(unique_dates.iloc[-1]) + pd.Timedelta(days=1)
+    windows: list[dict[str, Any]] = []
+    fold_id = 1
+    train_start = first_session_date
+    while True:
+        train_end = train_start + pd.DateOffset(years=config.walk_forward_train_years)
+        test_start = train_end
+        test_end = test_start + pd.DateOffset(years=config.walk_forward_test_years)
+        if test_end > last_session_date_exclusive:
+            break
+        train_mask = session_table["session_date"].ge(train_start) & session_table["session_date"].lt(train_end)
+        test_mask = session_table["session_date"].ge(test_start) & session_table["session_date"].lt(test_end)
+        if not train_mask.any() or not test_mask.any():
+            break
+        windows.append(
+            {
+                "fold_id": fold_id,
+                "train_start": train_start,
+                "train_end": train_end,
+                "test_start": test_start,
+                "test_end": test_end,
+                "train_sessions": int(train_mask.sum()),
+                "test_sessions": int(test_mask.sum()),
+            }
+        )
+        fold_id += 1
+        train_start = train_start + pd.DateOffset(months=config.walk_forward_step_months)
+    return pd.DataFrame(windows)
+
+
+def _walk_forward_candidate_configs(config: BacktestConfig) -> list[BacktestConfig]:
+    candidates: list[BacktestConfig] = []
+    for atr_period in config.walk_forward_atr_periods:
+        for tp_sl_mode in config.walk_forward_tp_sl_modes:
+            k_values = config.walk_forward_ks if tp_sl_mode == "prior_day_range" else (config.k,)
+            for atr_multiplier in config.walk_forward_atr_multipliers:
+                for k in k_values:
+                    candidates.append(
+                        replace(
+                            config,
+                            atr_period=atr_period,
+                            tp_sl_mode=tp_sl_mode,
+                            atr_multiplier=atr_multiplier,
+                            k=k,
+                        )
+                    )
+    return candidates
+
+
+def _walk_forward_objective_value(metrics: pd.Series, objective: str) -> float:
+    value = metrics.get(objective, np.nan)
+    return float(value) if pd.notna(value) else float("-inf")
+
+
+def _walk_forward_selection_key(metrics: pd.Series, objective: str) -> tuple[float, float, float, float]:
+    objective_value = _walk_forward_objective_value(metrics, objective)
+    total_return = metrics.get("total_return_pct", np.nan)
+    sharpe_ratio = metrics.get("sharpe_ratio", np.nan)
+    max_drawdown = metrics.get("max_drawdown_pct", np.nan)
+    total_trades = metrics.get("total_trades", np.nan)
+    return (
+        objective_value,
+        float(total_return) if pd.notna(total_return) else float("-inf"),
+        float(sharpe_ratio) if pd.notna(sharpe_ratio) else float("-inf"),
+        -float(max_drawdown) if pd.notna(max_drawdown) else float("-inf"),
+        float(total_trades) if pd.notna(total_trades) else float("-inf"),
+    )
+
+
+def _build_walk_forward_parameter_stability(fold_summary: pd.DataFrame) -> pd.DataFrame:
+    if fold_summary.empty:
+        return pd.DataFrame(columns=["parameter", "value", "selected_folds", "selected_pct"])
+    rows: list[dict[str, Any]] = []
+    total_folds = int(fold_summary["fold_id"].nunique())
+    for parameter in ["atr_period", "tp_sl_mode", "atr_multiplier", "k"]:
+        counts = fold_summary[parameter].value_counts(dropna=False).sort_index()
+        for value, count in counts.items():
+            rows.append(
+                {
+                    "parameter": parameter,
+                    "value": value,
+                    "selected_folds": int(count),
+                    "selected_pct": (100.0 * int(count) / total_folds) if total_folds else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _stitch_walk_forward_oos_equity(
+    oos_equity_frames: list[pd.DataFrame],
+    starting_capital: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not oos_equity_frames:
+        empty_curve = pd.DataFrame(
+            columns=[
+                "ts_event",
+                "session_id",
+                "session_date",
+                "session_open_bar",
+                "session_close_bar",
+                "gross_delta",
+                "net_delta",
+                "fold_id",
+                "selected_atr_period",
+                "selected_tp_sl_mode",
+                "selected_atr_multiplier",
+                "selected_k",
+                "gross_equity",
+                "net_equity",
+                "gross_running_peak",
+                "net_running_peak",
+                "gross_drawdown_pct",
+                "net_drawdown_pct",
+            ]
+        )
+        return empty_curve, empty_curve.loc[empty_curve.get("session_close_bar", pd.Series(dtype=bool))].copy()
+    stitched = pd.concat(oos_equity_frames, ignore_index=True).sort_values(["ts_event", "fold_id"]).reset_index(drop=True)
+    if stitched["ts_event"].duplicated().any():
+        raise ValueError("Walk-forward OOS windows overlap; stitched OOS equity cannot contain duplicate timestamps.")
+    stitched["gross_equity"] = starting_capital + stitched["gross_delta"].cumsum()
+    stitched["net_equity"] = starting_capital + stitched["net_delta"].cumsum()
+    stitched["gross_running_peak"] = stitched["gross_equity"].cummax()
+    stitched["net_running_peak"] = stitched["net_equity"].cummax()
+    stitched["gross_drawdown_pct"] = (stitched["gross_equity"] / stitched["gross_running_peak"] - 1.0) * 100.0
+    stitched["net_drawdown_pct"] = (stitched["net_equity"] / stitched["net_running_peak"] - 1.0) * 100.0
+    stitched_session_equity = stitched.loc[stitched["session_close_bar"]].copy().reset_index(drop=True)
+    return stitched.reset_index(drop=True), stitched_session_equity
+
+
+def run_walk_forward_analysis(prepared: PreparedData, config: BacktestConfig) -> WalkForwardResult:
+    _validate_config(config)
+    fold_windows = _build_walk_forward_windows(config, prepared.session_table)
+    if fold_windows.empty:
+        raise ValueError("No complete walk-forward folds are available for the configured train/test windows.")
+
+    candidate_configs = _walk_forward_candidate_configs(config)
+    atr_prepared_cache = {
+        atr_period: with_atr_period(prepared, atr_period)
+        for atr_period in sorted({candidate.atr_period for candidate in candidate_configs})
+    }
+    subset_cache: dict[tuple[int, str, int], PreparedData] = {}
+    optimization_rows: list[dict[str, Any]] = []
+    fold_rows: list[dict[str, Any]] = []
+    oos_equity_frames: list[pd.DataFrame] = []
+    oos_trade_frames: list[pd.DataFrame] = []
+
+    for fold in fold_windows.to_dict("records"):
+        fold_id = int(fold["fold_id"])
+        best_candidate: BacktestConfig | None = None
+        best_train_result: BacktestResult | None = None
+        best_selection_key: tuple[float, float, float, float] | None = None
+
+        for candidate in candidate_configs:
+            train_cache_key = (fold_id, "train", candidate.atr_period)
+            if train_cache_key not in subset_cache:
+                subset_cache[train_cache_key] = _subset_prepared_by_session_date_range(
+                    atr_prepared_cache[candidate.atr_period],
+                    fold["train_start"],
+                    fold["train_end"],
+                )
+            train_prepared = subset_cache[train_cache_key]
+            train_result = run_backtest(train_prepared, candidate)
+            train_metrics = train_result.performance_summary
+            train_objective_value = _walk_forward_objective_value(train_metrics, config.walk_forward_objective)
+            optimization_rows.append(
+                {
+                    "fold_id": fold_id,
+                    "train_start": fold["train_start"],
+                    "train_end": fold["train_end"],
+                    "test_start": fold["test_start"],
+                    "test_end": fold["test_end"],
+                    "atr_period": candidate.atr_period,
+                    "tp_sl_mode": candidate.tp_sl_mode,
+                    "atr_multiplier": candidate.atr_multiplier,
+                    "k": candidate.k,
+                    "objective": config.walk_forward_objective,
+                    "train_objective_value": train_objective_value,
+                    "train_sharpe_ratio": train_metrics.get("sharpe_ratio", np.nan),
+                    "train_total_return_pct": train_metrics.get("total_return_pct", np.nan),
+                    "train_max_drawdown_pct": train_metrics.get("max_drawdown_pct", np.nan),
+                    "train_total_trades": train_metrics.get("total_trades", np.nan),
+                }
+            )
+            selection_key = _walk_forward_selection_key(train_metrics, config.walk_forward_objective)
+            if best_selection_key is None or selection_key > best_selection_key:
+                best_selection_key = selection_key
+                best_candidate = candidate
+                best_train_result = train_result
+
+        if best_candidate is None or best_train_result is None:
+            raise ValueError(f"Walk-forward fold {fold_id} produced no candidate results.")
+
+        test_cache_key = (fold_id, "test", best_candidate.atr_period)
+        if test_cache_key not in subset_cache:
+            subset_cache[test_cache_key] = _subset_prepared_by_session_date_range(
+                atr_prepared_cache[best_candidate.atr_period],
+                fold["test_start"],
+                fold["test_end"],
+            )
+        test_prepared = subset_cache[test_cache_key]
+        oos_result = run_backtest(test_prepared, best_candidate)
+        oos_metrics = oos_result.performance_summary
+        train_metrics = best_train_result.performance_summary
+
+        fold_rows.append(
+            {
+                "fold_id": fold_id,
+                "train_start": fold["train_start"],
+                "train_end": fold["train_end"],
+                "test_start": fold["test_start"],
+                "test_end": fold["test_end"],
+                "train_sessions": fold["train_sessions"],
+                "test_sessions": fold["test_sessions"],
+                "objective": config.walk_forward_objective,
+                "selected_atr_period": best_candidate.atr_period,
+                "selected_tp_sl_mode": best_candidate.tp_sl_mode,
+                "selected_atr_multiplier": best_candidate.atr_multiplier,
+                "selected_k": best_candidate.k,
+                "train_objective_value": _walk_forward_objective_value(train_metrics, config.walk_forward_objective),
+                "train_sharpe_ratio": train_metrics.get("sharpe_ratio", np.nan),
+                "train_total_return_pct": train_metrics.get("total_return_pct", np.nan),
+                "train_max_drawdown_pct": train_metrics.get("max_drawdown_pct", np.nan),
+                "train_total_trades": train_metrics.get("total_trades", np.nan),
+                "oos_sharpe_ratio": oos_metrics.get("sharpe_ratio", np.nan),
+                "oos_total_return_pct": oos_metrics.get("total_return_pct", np.nan),
+                "oos_max_drawdown_pct": oos_metrics.get("max_drawdown_pct", np.nan),
+                "oos_total_trades": oos_metrics.get("total_trades", np.nan),
+                "oos_terminal_net_equity": oos_metrics.get("terminal_net_equity", np.nan),
+            }
+        )
+
+        if not oos_result.equity_curve.empty:
+            oos_equity = oos_result.equity_curve.copy()
+            oos_equity["fold_id"] = fold_id
+            oos_equity["selected_atr_period"] = best_candidate.atr_period
+            oos_equity["selected_tp_sl_mode"] = best_candidate.tp_sl_mode
+            oos_equity["selected_atr_multiplier"] = best_candidate.atr_multiplier
+            oos_equity["selected_k"] = best_candidate.k
+            oos_equity_frames.append(oos_equity)
+        if not oos_result.trade_log.empty:
+            oos_trade_log = oos_result.trade_log.copy()
+            oos_trade_log["fold_id"] = fold_id
+            oos_trade_log["selected_atr_period"] = best_candidate.atr_period
+            oos_trade_log["selected_tp_sl_mode"] = best_candidate.tp_sl_mode
+            oos_trade_log["selected_atr_multiplier"] = best_candidate.atr_multiplier
+            oos_trade_log["selected_k"] = best_candidate.k
+            oos_trade_frames.append(oos_trade_log)
+
+    fold_summary = pd.DataFrame(fold_rows)
+    optimization_results = pd.DataFrame(optimization_rows)
+    parameter_stability = _build_walk_forward_parameter_stability(
+        fold_summary.rename(
+            columns={
+                "selected_atr_period": "atr_period",
+                "selected_tp_sl_mode": "tp_sl_mode",
+                "selected_atr_multiplier": "atr_multiplier",
+                "selected_k": "k",
+            }
+        )
+    )
+    oos_equity_curve, oos_session_equity = _stitch_walk_forward_oos_equity(
+        oos_equity_frames=oos_equity_frames,
+        starting_capital=config.starting_capital,
+    )
+    oos_trade_log = pd.concat(oos_trade_frames, ignore_index=True) if oos_trade_frames else pd.DataFrame()
+    diagnostics = {
+        "fold_windows": fold_windows,
+        "candidate_count": len(candidate_configs),
+        "objective": config.walk_forward_objective,
+    }
+    return WalkForwardResult(
+        config=config,
+        fold_summary=fold_summary,
+        optimization_results=optimization_results,
+        parameter_stability=parameter_stability,
+        oos_equity_curve=oos_equity_curve,
+        oos_session_equity=oos_session_equity,
+        oos_trade_log=oos_trade_log,
+        diagnostics=diagnostics,
+    )
 
 
 def run_validations(
