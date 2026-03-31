@@ -742,7 +742,14 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
             )
 
         session_open_equity = current_equity
-        pending_orders = _initialize_pending_orders(open_bar, config, session_open_equity)
+        if open_positions:
+            pending_orders = {
+                "active": False,
+                "skip_reason": "Open position carried into session; new session orders suppressed.",
+                "skip_reason_code": "carry_position",
+            }
+        else:
+            pending_orders = _initialize_pending_orders(open_bar, config, session_open_equity)
         if pending_orders["active"]:
             session_sizing_log.append(
                 {
@@ -761,6 +768,7 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
                 {
                     "session_id": session_id,
                     "session_date": session_row["session_date"],
+                    "ts_event": open_bar["ts_event"],
                     "reason": pending_orders["skip_reason"],
                 }
             )
@@ -1353,9 +1361,13 @@ def _build_performance_summary(
     cost_drag = gross_total_pnl - net_total_pnl
     cost_drag_pct = _safe_ratio(cost_drag, gross_total_pnl) * 100.0 if gross_total_pnl != 0 else np.nan
     ambiguous_entry_skips = 0
+    carry_position_skips = 0
     if not skipped_sessions_df.empty and "reason" in skipped_sessions_df.columns:
         ambiguous_entry_skips = int(
             skipped_sessions_df["reason"].fillna("").str.startswith("Ambiguous hourly OCO trigger").sum()
+        )
+        carry_position_skips = int(
+            skipped_sessions_df["reason"].fillna("").eq("Open position carried into session; new session orders suppressed.").sum()
         )
     return pd.Series(
         {
@@ -1391,6 +1403,7 @@ def _build_performance_summary(
             "cancelled_orders": int(order_cancellations_df.shape[0]),
             "margin_flag_sessions": int(margin_flags_df.shape[0]),
             "ambiguous_entry_skip_sessions": ambiguous_entry_skips,
+            "carry_position_skip_sessions": carry_position_skips,
         }
     )
 
@@ -1504,6 +1517,7 @@ def _finalize_backtest_results(
             "floor_events": floor_events_df,
             "event_log": event_log_df,
             "session_sizing": session_sizing_df,
+            "skipped_sessions": skipped_sessions_df,
             "equity_curve": equity_curve,
         },
         config=config,
@@ -1603,6 +1617,7 @@ def run_validations(
     floor_events = result_frames["floor_events"]
     event_log = result_frames["event_log"]
     session_sizing = result_frames["session_sizing"]
+    skipped_sessions = result_frames["skipped_sessions"]
     validations: list[dict[str, Any]] = []
 
     open_bars = data.loc[data["session_open_bar"], ["session_id", "prev_session_high", "prev_session_low"]].copy()
@@ -1729,6 +1744,25 @@ def run_validations(
             "test": "OCO same-bar enforcement",
             "status": "pass" if oco_same_bar_ok else "fail",
             "detail": "No session bar creates simultaneous long and short entries under the hourly OCO rule.",
+        }
+    )
+
+    carry_position_skip_ok = True
+    if not skipped_sessions.empty and not trade_log.empty and "reason" in skipped_sessions.columns:
+        carry_skip_sessions = set(
+            skipped_sessions.loc[
+                skipped_sessions["reason"].eq("Open position carried into session; new session orders suppressed."),
+                "session_id",
+            ].tolist()
+        )
+        carry_position_skip_ok = bool(
+            trade_log.loc[trade_log["entry_session_id"].isin(carry_skip_sessions)].empty
+        )
+    validations.append(
+        {
+            "test": "Carry-position session suppression",
+            "status": "pass" if carry_position_skip_ok else "fail",
+            "detail": "Sessions skipped because a position was already open do not create new entries.",
         }
     )
     return pd.DataFrame(validations)
