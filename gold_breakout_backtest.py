@@ -82,6 +82,8 @@ class PositionState:
     current_trail_stop_adj: float
     highest_favorable_price_adj: float | None
     lowest_favorable_price_adj: float | None
+    max_price_seen_adj: float
+    min_price_seen_adj: float
     current_contract: str
     sizing_equity: float
     floor_applied: bool
@@ -1014,6 +1016,9 @@ def _process_session_open_gap_checks(
         stop_unadjusted = position.current_trail_stop_adj - float(open_bar["adj_factor"])
         initial_sl_unadjusted = position.initial_sl_adj - float(open_bar["adj_factor"])
         open_price = float(open_bar["open"])
+        open_price_adj = open_price + float(open_bar["adj_factor"])
+        position.max_price_seen_adj = max(position.max_price_seen_adj, open_price_adj)
+        position.min_price_seen_adj = min(position.min_price_seen_adj, open_price_adj)
         should_close = False
         exit_reason = None
         if position.direction == "long":
@@ -1263,6 +1268,8 @@ def _open_position(
         current_trail_stop_adj=initial_sl_adj,
         highest_favorable_price_adj=high_favorable,
         lowest_favorable_price_adj=low_favorable,
+        max_price_seen_adj=adj_entry,
+        min_price_seen_adj=adj_entry,
         current_contract=str(bar["dominant_contract"]),
         sizing_equity=float(pending_orders["sizing_equity"]),
         floor_applied=bool(pending_orders["floor_applied"]),
@@ -1352,6 +1359,9 @@ def _evaluate_position_on_bar(
                 "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
             }
 
+    position.max_price_seen_adj = max(position.max_price_seen_adj, float(bar["adj_high"]))
+    position.min_price_seen_adj = min(position.min_price_seen_adj, float(bar["adj_low"]))
+
     atr_value = bar["atr"]
     if pd.notna(atr_value):
         if position.direction == "long":
@@ -1371,6 +1381,30 @@ def _evaluate_position_on_bar(
     return None
 
 
+def _compute_trade_excursions(
+    position: PositionState,
+    exit_bar: pd.Series,
+    exit_price: float,
+) -> dict[str, float]:
+    exit_adj_price = exit_price + float(exit_bar["adj_factor"])
+    max_price_seen_adj = max(position.max_price_seen_adj, exit_adj_price)
+    min_price_seen_adj = min(position.min_price_seen_adj, exit_adj_price)
+    if position.direction == "long":
+        mfe_price = max_price_seen_adj - position.entry_adj_price
+        mae_price = position.entry_adj_price - min_price_seen_adj
+    else:
+        mfe_price = position.entry_adj_price - min_price_seen_adj
+        mae_price = max_price_seen_adj - position.entry_adj_price
+    mfe_price = max(float(mfe_price), 0.0)
+    mae_price = max(float(mae_price), 0.0)
+    return {
+        "mfe_price": mfe_price,
+        "mae_price": mae_price,
+        "mfe_usd": mfe_price * position.contracts * CONTRACT_MULTIPLIER,
+        "mae_usd": mae_price * position.contracts * CONTRACT_MULTIPLIER,
+    }
+
+
 def _close_position(
     position: PositionState,
     exit_bar: pd.Series,
@@ -1385,6 +1419,7 @@ def _close_position(
         exit_price=exit_price,
         contracts=position.contracts,
     )
+    excursions = _compute_trade_excursions(position, exit_bar, exit_price)
     incremental_net = incremental_gross - (position.contracts * ROUND_TURN_COST)
     current_equity += incremental_net
     gross_pnl = position.realized_roll_pnl + incremental_gross
@@ -1427,6 +1462,10 @@ def _close_position(
         "current_contract_at_exit": position.current_contract,
         "incremental_gross_pnl": incremental_gross,
         "incremental_net_pnl": incremental_net,
+        "mfe_price": excursions["mfe_price"],
+        "mae_price": excursions["mae_price"],
+        "mfe_usd": excursions["mfe_usd"],
+        "mae_usd": excursions["mae_usd"],
     }
     return trade_record, current_equity
 
@@ -1597,6 +1636,10 @@ def _build_direction_summary(trade_log: pd.DataFrame) -> pd.DataFrame:
                 "avg_loss_usd": losses["net_pnl"].mean() if not losses.empty else np.nan,
                 "profit_factor": _safe_ratio(wins["gross_pnl"].sum(), abs(losses["gross_pnl"].sum())),
                 "avg_bars_held": subset["bars_held"].mean(),
+                "avg_mfe_price": subset["mfe_price"].mean(),
+                "avg_mae_price": subset["mae_price"].mean(),
+                "avg_mfe_usd": subset["mfe_usd"].mean(),
+                "avg_mae_usd": subset["mae_usd"].mean(),
             }
         )
     return pd.DataFrame(rows)
@@ -1949,6 +1992,22 @@ def run_validations(
             "test": "Max contract cap enforcement",
             "status": "pass" if max_contract_cap_ok else "fail",
             "detail": "Each trade's contracts do not exceed the configured hard contract cap.",
+        }
+    )
+
+    mae_mfe_ok = True
+    if not trade_log.empty:
+        mae_mfe_columns = ["mfe_price", "mae_price", "mfe_usd", "mae_usd"]
+        mae_mfe_ok = bool(
+            set(mae_mfe_columns).issubset(trade_log.columns)
+            and trade_log[mae_mfe_columns].notna().all().all()
+            and (trade_log[mae_mfe_columns] >= 0.0).all().all()
+        )
+    validations.append(
+        {
+            "test": "MAE/MFE diagnostics",
+            "status": "pass" if mae_mfe_ok else "fail",
+            "detail": "Trade-level MAE/MFE diagnostics are populated and non-negative.",
         }
     )
 
