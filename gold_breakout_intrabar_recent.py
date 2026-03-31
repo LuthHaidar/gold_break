@@ -8,7 +8,6 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.animation import FuncAnimation
 
 
 VALID_TP_SL_MODES = ("symmetric_fixed", "atr_based", "prior_day_range")
@@ -38,24 +37,6 @@ class RecentIntrabarConfig:
         payload = asdict(self)
         payload["cache_dir"] = str(self.cache_dir)
         return payload
-
-
-@dataclass(frozen=True)
-class RecentIntrabarReplayConfig:
-    tp_sl_mode: str = "prior_day_range"
-    fixed_ticks: int = 100
-    atr_multiplier_tpsl: float = 2.0
-    k: float = 0.50
-    atr_period: int = 14
-    atr_multiplier: float = 1.5
-    allow_independent_long_short: bool = True
-    close_positions_at_session_end: bool = True
-    frame_step: int = 5
-    animation_interval_ms: int = 120
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
 class IntrabarPositionState:
@@ -1010,45 +991,3 @@ def plot_intrabar_session_replay(
     _render_intrabar_session_frame(ax, diagnostic, session_id, end_bar_index=None)
     figure.tight_layout()
     return figure
-
-
-def animate_intrabar_session_replay(
-    diagnostic: dict[str, Any],
-    session_id: int,
-    frame_step: int | None = None,
-    interval_ms: int | None = None,
-    figsize: tuple[float, float] = (15.0, 7.5),
-) -> FuncAnimation:
-    frame_state = diagnostic["frame_state"]
-    session_frames = (
-        frame_state.loc[frame_state["session_id"].eq(session_id)]
-        .sort_values("bar_index")
-        .reset_index(drop=True)
-    )
-    if session_frames.empty:
-        raise ValueError(f"No intrabar frame state is available for session_id={session_id}.")
-
-    replay_config = diagnostic["replay_config"]
-    effective_frame_step = max(int(frame_step or replay_config.frame_step), 1)
-    effective_interval_ms = int(interval_ms or replay_config.animation_interval_ms)
-    frame_sequence = session_frames["bar_index"].astype(int).tolist()[::effective_frame_step]
-    final_bar_index = int(session_frames["bar_index"].iloc[-1])
-    if not frame_sequence or frame_sequence[-1] != final_bar_index:
-        frame_sequence.append(final_bar_index)
-
-    figure, ax = plt.subplots(figsize=figsize)
-
-    def _update(end_bar_index: int) -> list[Any]:
-        _render_intrabar_session_frame(ax, diagnostic, session_id, end_bar_index=end_bar_index)
-        figure.tight_layout()
-        return []
-
-    animation = FuncAnimation(
-        figure,
-        _update,
-        frames=frame_sequence,
-        interval=effective_interval_ms,
-        repeat=False,
-        blit=False,
-    )
-    return animation
