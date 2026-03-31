@@ -46,6 +46,8 @@ class BacktestConfig:
     atr_period: int = 14
     atr_multiplier: float = 1.5
     risk_fraction: float = 0.01
+    initial_margin_per_contract: float = 15_000.0
+    max_margin_fraction: float = 0.50
     sensitivity_atr_periods: tuple[int, ...] = (7, 14, 21)
     sensitivity_atr_multipliers: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0)
     sensitivity_ks: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00)
@@ -160,6 +162,10 @@ def _validate_config(config: BacktestConfig) -> None:
         raise ValueError("k must be positive.")
     if config.risk_fraction <= 0:
         raise ValueError("risk_fraction must be positive.")
+    if config.initial_margin_per_contract <= 0:
+        raise ValueError("initial_margin_per_contract must be positive.")
+    if config.max_margin_fraction <= 0 or config.max_margin_fraction > 1:
+        raise ValueError("max_margin_fraction must be in the interval (0, 1].")
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -191,18 +197,41 @@ def _compute_sl_distance(
     raise ValueError(f"Unsupported tp_sl_mode: {tp_sl_mode}")
 
 
-def _position_size(current_equity: float, sl_distance_price: float, risk_fraction: float) -> dict[str, Any]:
+def _position_size(
+    current_equity: float,
+    sl_distance_price: float,
+    risk_fraction: float,
+    initial_margin_per_contract: float,
+    max_margin_fraction: float,
+) -> dict[str, Any]:
     risk_per_trade = current_equity * risk_fraction
     sl_distance_ticks = sl_distance_price / TICK_SIZE
     sl_distance_usd = sl_distance_ticks * TICK_VALUE
     raw_contracts = int(np.floor(risk_per_trade / sl_distance_usd)) if sl_distance_usd > 0 else 0
-    contracts = max(raw_contracts, 1)
+    floor_contracts = max(raw_contracts, 1)
+    allowed_initial_margin = current_equity * max_margin_fraction
+    margin_allowed_contracts = (
+        int(np.floor(allowed_initial_margin / initial_margin_per_contract))
+        if initial_margin_per_contract > 0
+        else 0
+    )
+    contracts = min(floor_contracts, margin_allowed_contracts) if margin_allowed_contracts >= 1 else 0
+    margin_cap_applied = margin_allowed_contracts >= 1 and contracts < floor_contracts
+    margin_cap_blocked = margin_allowed_contracts < 1
     return {
         "risk_per_trade": risk_per_trade,
         "sl_distance_usd": sl_distance_usd,
         "raw_contracts": raw_contracts,
+        "floor_contracts": floor_contracts,
         "contracts": contracts,
-        "floor_applied": raw_contracts < 1,
+        "floor_applied": raw_contracts < 1 and contracts == 1,
+        "allowed_initial_margin": allowed_initial_margin,
+        "initial_margin_per_contract": initial_margin_per_contract,
+        "margin_allowed_contracts": margin_allowed_contracts,
+        "required_initial_margin": floor_contracts * initial_margin_per_contract,
+        "selected_initial_margin": contracts * initial_margin_per_contract,
+        "margin_cap_applied": margin_cap_applied,
+        "margin_cap_blocked": margin_cap_blocked,
     }
 
 
@@ -675,7 +704,6 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
     event_log: list[dict[str, Any]] = []
     concurrency_log: list[dict[str, Any]] = []
     session_sizing_log: list[dict[str, Any]] = []
-    session_margin_flagged: set[int] = set()
     session_concurrent_long_short: set[int] = set()
     current_equity = float(config.starting_capital)
     trade_id_counter = 1
@@ -767,11 +795,34 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
                     "session_open_equity": session_open_equity,
                     "risk_per_trade": pending_orders["risk_per_trade"],
                     "contracts": pending_orders["contracts"],
+                    "raw_contracts": pending_orders["raw_contracts"],
+                    "floor_contracts": pending_orders["floor_contracts"],
+                    "margin_allowed_contracts": pending_orders["margin_allowed_contracts"],
                     "floor_applied": pending_orders["floor_applied"],
+                    "margin_cap_applied": pending_orders["margin_cap_applied"],
                     "sl_distance_price": pending_orders["sl_distance_price"],
                     "sl_distance_usd": pending_orders["sl_distance_usd"],
+                    "allowed_initial_margin": pending_orders["allowed_initial_margin"],
+                    "required_initial_margin": pending_orders["required_initial_margin"],
+                    "selected_initial_margin": pending_orders["selected_initial_margin"],
+                    "initial_margin_per_contract": pending_orders["initial_margin_per_contract"],
                 }
             )
+            if pending_orders["margin_cap_applied"]:
+                margin_flags.append(
+                    {
+                        "session_id": session_id,
+                        "session_date": session_row["session_date"],
+                        "ts_event": open_bar["ts_event"],
+                        "flag_type": "margin_cap_applied",
+                        "requested_contracts": pending_orders["floor_contracts"],
+                        "allowed_contracts": pending_orders["margin_allowed_contracts"],
+                        "selected_contracts": pending_orders["contracts"],
+                        "allowed_initial_margin": pending_orders["allowed_initial_margin"],
+                        "required_initial_margin": pending_orders["required_initial_margin"],
+                        "selected_initial_margin": pending_orders["selected_initial_margin"],
+                    }
+                )
         else:
             skipped_sessions.append(
                 {
@@ -781,6 +832,21 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
                     "reason": pending_orders["skip_reason"],
                 }
             )
+            if pending_orders.get("skip_reason_code") == "margin_cap_blocked":
+                margin_flags.append(
+                    {
+                        "session_id": session_id,
+                        "session_date": session_row["session_date"],
+                        "ts_event": open_bar["ts_event"],
+                        "flag_type": "margin_cap_blocked",
+                        "requested_contracts": pending_orders["floor_contracts"],
+                        "allowed_contracts": pending_orders["margin_allowed_contracts"],
+                        "selected_contracts": 0,
+                        "allowed_initial_margin": pending_orders["allowed_initial_margin"],
+                        "required_initial_margin": pending_orders["required_initial_margin"],
+                        "selected_initial_margin": 0.0,
+                    }
+                )
 
         for _, bar in session_bars.iterrows():
             existing_positions = [pos for pos in open_positions if pos.entry_bar_seq < int(bar["bar_seq"])]
@@ -844,17 +910,6 @@ def run_backtest(prepared: PreparedData, config: BacktestConfig) -> BacktestResu
             concurrency_log.append(concurrency_snapshot)
             if concurrency_snapshot["simultaneous_long_short"]:
                 session_concurrent_long_short.add(session_id)
-            if concurrency_snapshot["open_contracts"] > 2 and session_id not in session_margin_flagged:
-                session_margin_flagged.add(session_id)
-                margin_flags.append(
-                    {
-                        "session_id": session_id,
-                        "session_date": session_row["session_date"],
-                        "ts_event": bar["ts_event"],
-                        "open_contracts": concurrency_snapshot["open_contracts"],
-                        "open_positions": concurrency_snapshot["open_positions"],
-                    }
-                )
 
             if bool(bar["session_close_bar"]) and pending_orders["active"]:
                 if not pending_orders["long_triggered"]:
@@ -959,11 +1014,31 @@ def _initialize_pending_orders(open_bar: pd.Series, config: BacktestConfig, sess
         return {
             "active": False,
             "skip_reason": "Insufficient confirmed session inputs for order placement.",
+            "skip_reason_code": "insufficient_inputs",
         }
-    sizing = _position_size(session_open_equity, float(sl_distance), config.risk_fraction)
+    sizing = _position_size(
+        session_open_equity,
+        float(sl_distance),
+        config.risk_fraction,
+        config.initial_margin_per_contract,
+        config.max_margin_fraction,
+    )
+    if sizing["margin_cap_blocked"]:
+        return {
+            "active": False,
+            "skip_reason": "Initial margin cap prevents minimum one-contract entry.",
+            "skip_reason_code": "margin_cap_blocked",
+            "session_id": int(open_bar["session_id"]),
+            "session_date": open_bar["session_date"],
+            "floor_contracts": sizing["floor_contracts"],
+            "margin_allowed_contracts": sizing["margin_allowed_contracts"],
+            "allowed_initial_margin": sizing["allowed_initial_margin"],
+            "required_initial_margin": sizing["required_initial_margin"],
+        }
     return {
         "active": True,
         "skip_reason": None,
+        "skip_reason_code": None,
         "session_id": int(open_bar["session_id"]),
         "session_date": open_bar["session_date"],
         "buy_stop_adj": float(open_bar["prev_session_high"]),
@@ -972,8 +1047,15 @@ def _initialize_pending_orders(open_bar: pd.Series, config: BacktestConfig, sess
         "risk_per_trade": sizing["risk_per_trade"],
         "sl_distance_usd": sizing["sl_distance_usd"],
         "contracts": sizing["contracts"],
-        "floor_applied": sizing["floor_applied"],
         "raw_contracts": sizing["raw_contracts"],
+        "floor_contracts": sizing["floor_contracts"],
+        "floor_applied": sizing["floor_applied"],
+        "allowed_initial_margin": sizing["allowed_initial_margin"],
+        "initial_margin_per_contract": sizing["initial_margin_per_contract"],
+        "margin_allowed_contracts": sizing["margin_allowed_contracts"],
+        "required_initial_margin": sizing["required_initial_margin"],
+        "selected_initial_margin": sizing["selected_initial_margin"],
+        "margin_cap_applied": sizing["margin_cap_applied"],
         "sizing_equity": session_open_equity,
         "long_triggered": False,
         "short_triggered": False,
@@ -1372,12 +1454,21 @@ def _build_performance_summary(
     cost_drag_pct = _safe_ratio(cost_drag, gross_total_pnl) * 100.0 if gross_total_pnl != 0 else np.nan
     ambiguous_entry_skips = 0
     carry_position_skips = 0
+    margin_cap_applied_sessions = 0
+    margin_cap_blocked_sessions = 0
     if not skipped_sessions_df.empty and "reason" in skipped_sessions_df.columns:
         ambiguous_entry_skips = int(
             skipped_sessions_df["reason"].fillna("").str.startswith("Ambiguous hourly OCO trigger").sum()
         )
         carry_position_skips = int(
             skipped_sessions_df["reason"].fillna("").eq("Open position carried into session; new session orders suppressed.").sum()
+        )
+    if not margin_flags_df.empty and "flag_type" in margin_flags_df.columns:
+        margin_cap_applied_sessions = int(
+            margin_flags_df["flag_type"].eq("margin_cap_applied").sum()
+        )
+        margin_cap_blocked_sessions = int(
+            margin_flags_df["flag_type"].eq("margin_cap_blocked").sum()
         )
     return pd.Series(
         {
@@ -1412,6 +1503,8 @@ def _build_performance_summary(
             "cost_drag_pct_of_gross": cost_drag_pct,
             "cancelled_orders": int(order_cancellations_df.shape[0]),
             "margin_flag_sessions": int(margin_flags_df.shape[0]),
+            "margin_cap_applied_sessions": margin_cap_applied_sessions,
+            "margin_cap_blocked_sessions": margin_cap_blocked_sessions,
             "ambiguous_entry_skip_sessions": ambiguous_entry_skips,
             "carry_position_skip_sessions": carry_position_skips,
         }
@@ -1748,6 +1841,19 @@ def run_validations(
             "test": "Equity monotonicity check",
             "status": "pass" if (equity_entry_ok and sizing_consistency_ok) else "fail",
             "detail": "Entries do not change equity, and each trade uses the session-open sizing equity.",
+        }
+    )
+
+    margin_cap_ok = True
+    if not trade_log.empty:
+        margin_budget = trade_log["sizing_equity"] * config.max_margin_fraction
+        required_margin = trade_log["contracts"] * config.initial_margin_per_contract
+        margin_cap_ok = bool((required_margin <= margin_budget + 1e-9).all())
+    validations.append(
+        {
+            "test": "Margin cap enforcement",
+            "status": "pass" if margin_cap_ok else "fail",
+            "detail": "Each trade's initial margin fits within the configured margin-fraction cap.",
         }
     )
 
