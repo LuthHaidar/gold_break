@@ -7,6 +7,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Rectangle
 
 
 EXPECTED_COLUMNS = [
@@ -2870,6 +2871,221 @@ def plot_sizing_sensitivity_curve(sizing_grid: pd.DataFrame) -> plt.Figure:
     ax1.set_ylabel("Terminal net equity")
     ax2.set_ylabel("Max drawdown %")
     ax1.grid(True, alpha=0.2)
+    fig.tight_layout()
+    return fig
+
+
+def _reconstruct_session_trade_replay(
+    trade_row: pd.Series,
+    session_bars: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    trade_session_bars = session_bars.loc[
+        session_bars["ts_event"].ge(pd.Timestamp(trade_row["entry_bar_ts"]))
+    ].copy()
+    if trade_session_bars.empty:
+        return pd.DataFrame()
+    entry_bar = trade_session_bars.iloc[0]
+    current_trail_stop_adj = float(trade_row["initial_sl_price_adj"])
+    highest_favorable_price_adj = float(trade_row["entry_price"]) + float(entry_bar["adj_factor"])
+    lowest_favorable_price_adj = highest_favorable_price_adj
+    rows: list[dict[str, Any]] = []
+    exit_ts = pd.Timestamp(trade_row["exit_bar_ts"])
+    for _, bar in trade_session_bars.iterrows():
+        bar_ts = pd.Timestamp(bar["ts_event"])
+        rows.append(
+            {
+                "ts_event": bar_ts,
+                "active_trail_stop_adj": current_trail_stop_adj,
+                "tp_adj": float(trade_row["tp_price_adj"]),
+                "initial_sl_adj": float(trade_row["initial_sl_price_adj"]),
+            }
+        )
+        if bar_ts == exit_ts:
+            break
+        atr_value = bar["atr"]
+        if pd.notna(atr_value):
+            if trade_row["direction"] == "long":
+                highest_favorable_price_adj = max(highest_favorable_price_adj, float(bar["adj_high"]))
+                new_trail = highest_favorable_price_adj - (config.atr_multiplier * float(atr_value))
+                current_trail_stop_adj = max(current_trail_stop_adj, new_trail)
+            else:
+                lowest_favorable_price_adj = min(lowest_favorable_price_adj, float(bar["adj_low"]))
+                new_trail = lowest_favorable_price_adj + (config.atr_multiplier * float(atr_value))
+                current_trail_stop_adj = min(current_trail_stop_adj, new_trail)
+    return pd.DataFrame(rows)
+
+
+def _dedupe_legend(ax: plt.Axes) -> None:
+    handles, labels = ax.get_legend_handles_labels()
+    deduped: dict[str, Any] = {}
+    for handle, label in zip(handles, labels):
+        if label and label not in deduped:
+            deduped[label] = handle
+    if deduped:
+        ax.legend(deduped.values(), deduped.keys())
+
+
+def plot_session_replay(result: BacktestResult, session_id: int) -> plt.Figure:
+    session_bars = result.data.loc[result.data["session_id"] == session_id].copy().reset_index(drop=True)
+    if session_bars.empty:
+        raise ValueError(f"Session {session_id} is not present in result.data.")
+    session_date = pd.Timestamp(session_bars["session_date"].iloc[0]).date().isoformat()
+    session_bars["x"] = np.arange(len(session_bars), dtype=float)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    candle_width = 0.6
+    for _, bar in session_bars.iterrows():
+        x = float(bar["x"])
+        wick_color = "#666666"
+        body_color = "#12711c" if float(bar["adj_close"]) >= float(bar["adj_open"]) else "#8b1e3f"
+        ax.vlines(x, float(bar["adj_low"]), float(bar["adj_high"]), color=wick_color, linewidth=1.0, zorder=1)
+        body_low = min(float(bar["adj_open"]), float(bar["adj_close"]))
+        body_height = abs(float(bar["adj_close"]) - float(bar["adj_open"]))
+        if np.isclose(body_height, 0.0):
+            ax.hlines(float(bar["adj_open"]), x - candle_width / 2, x + candle_width / 2, color=body_color, linewidth=1.5, zorder=2)
+        else:
+            ax.add_patch(
+                Rectangle(
+                    (x - candle_width / 2, body_low),
+                    candle_width,
+                    body_height,
+                    facecolor=body_color,
+                    edgecolor=body_color,
+                    alpha=0.85,
+                    zorder=2,
+                )
+            )
+
+    first_bar = session_bars.iloc[0]
+    if pd.notna(first_bar["prev_session_high"]):
+        ax.axhline(float(first_bar["prev_session_high"]), color="royalblue", linestyle="--", linewidth=1.2, label="Buy stop / prior high")
+    if pd.notna(first_bar["prev_session_low"]):
+        ax.axhline(float(first_bar["prev_session_low"]), color="purple", linestyle="--", linewidth=1.2, label="Sell stop / prior low")
+
+    session_trades = result.trade_log.loc[result.trade_log["entry_session_id"] == session_id].copy()
+    for _, trade_row in session_trades.iterrows():
+        entry_matches = session_bars.loc[session_bars["ts_event"].eq(trade_row["entry_bar_ts"])]
+        if entry_matches.empty:
+            continue
+        entry_bar = entry_matches.iloc[0]
+        entry_x = float(entry_bar["x"])
+        entry_adj_price = float(trade_row["entry_price"]) + float(entry_bar["adj_factor"])
+        marker = "^" if trade_row["direction"] == "long" else "v"
+        color = "green" if trade_row["direction"] == "long" else "maroon"
+        ax.scatter(entry_x, entry_adj_price, color=color, marker=marker, s=90, zorder=5, label=f"{trade_row['direction'].title()} entry")
+
+        exit_matches = session_bars.loc[session_bars["ts_event"].eq(trade_row["exit_bar_ts"])]
+        exit_in_session = not exit_matches.empty
+        replay_levels = _reconstruct_session_trade_replay(trade_row, session_bars, result.config)
+        if not replay_levels.empty:
+            replay_x = replay_levels["ts_event"].map(session_bars.set_index("ts_event")["x"]).to_numpy(dtype=float)
+            ax.step(
+                replay_x,
+                replay_levels["active_trail_stop_adj"].to_numpy(dtype=float),
+                where="post",
+                color="firebrick",
+                linewidth=1.5,
+                label="Active trail",
+            )
+            tp_end_x = float(replay_x[-1]) if len(replay_x) else float(session_bars["x"].iloc[-1])
+        else:
+            tp_end_x = float(session_bars["x"].iloc[-1])
+        exit_x = float(exit_matches.iloc[0]["x"]) if exit_in_session else float(session_bars["x"].iloc[-1])
+        ax.hlines(
+            float(trade_row["initial_sl_price_adj"]),
+            xmin=entry_x,
+            xmax=exit_x,
+            color="firebrick",
+            linewidth=1.0,
+            linestyle=":",
+            label="Initial SL",
+        )
+        ax.hlines(
+            float(trade_row["tp_price_adj"]),
+            xmin=entry_x,
+            xmax=tp_end_x,
+            color="darkgreen",
+            linewidth=1.0,
+            linestyle=":",
+            label="TP",
+        )
+        if exit_in_session:
+            exit_bar = exit_matches.iloc[0]
+            exit_adj_price = float(trade_row["exit_price"]) + float(exit_bar["adj_factor"])
+            ax.scatter(
+                float(exit_bar["x"]),
+                exit_adj_price,
+                color="black",
+                marker="X",
+                s=90,
+                zorder=6,
+                label=f"Exit ({trade_row['exit_reason']})",
+            )
+        else:
+            ax.annotate(
+                "Open through session close",
+                xy=(float(session_bars["x"].iloc[-1]), float(session_bars["adj_close"].iloc[-1])),
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=8,
+                color="black",
+            )
+
+    session_cancellations = pd.DataFrame()
+    if not result.order_cancellations.empty and "session_id" in result.order_cancellations.columns:
+        session_cancellations = result.order_cancellations.loc[
+            result.order_cancellations["session_id"] == session_id
+        ].copy()
+    if not session_cancellations.empty:
+        x_lookup = session_bars.set_index("ts_event")["x"]
+        session_cancellations = session_cancellations.loc[session_cancellations["cancel_ts"].isin(x_lookup.index)].copy()
+        if not session_cancellations.empty:
+            session_cancellations["x"] = session_cancellations["cancel_ts"].map(x_lookup)
+            ax.scatter(
+                session_cancellations["x"],
+                session_cancellations["stop_level_adj"],
+                color="orange",
+                marker="x",
+                s=60,
+                zorder=5,
+                label="Order cancellation",
+            )
+
+    session_skips = pd.DataFrame()
+    if not result.skipped_sessions.empty and "session_id" in result.skipped_sessions.columns:
+        session_skips = result.skipped_sessions.loc[result.skipped_sessions["session_id"] == session_id].copy()
+    if not session_skips.empty:
+        x_lookup = session_bars.set_index("ts_event")["x"]
+        session_skips = session_skips.loc[session_skips["ts_event"].isin(x_lookup.index)].copy()
+        for _, skip_row in session_skips.iterrows():
+            skip_x = float(x_lookup.loc[skip_row["ts_event"]])
+            ax.axvline(skip_x, color="grey", alpha=0.25, linewidth=1.0)
+            ax.annotate(
+                str(skip_row["reason"]),
+                xy=(skip_x, float(session_bars["adj_high"].max())),
+                xytext=(6, -14),
+                textcoords="offset points",
+                fontsize=8,
+                rotation=90,
+                va="top",
+                color="grey",
+            )
+
+    tick_count = min(len(session_bars), 8)
+    tick_positions = np.linspace(0, len(session_bars) - 1, num=tick_count, dtype=int)
+    tick_positions = sorted(set(int(value) for value in tick_positions))
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(
+        [pd.Timestamp(session_bars.iloc[idx]["ts_event"]).strftime("%m-%d %H:%M") for idx in tick_positions],
+        rotation=45,
+        ha="right",
+    )
+    ax.set_title(f"Session Replay: session_id={session_id} ({session_date})")
+    ax.set_xlabel("Bar")
+    ax.set_ylabel("Adjusted Price")
+    ax.grid(True, alpha=0.2)
+    _dedupe_legend(ax)
     fig.tight_layout()
     return fig
 
