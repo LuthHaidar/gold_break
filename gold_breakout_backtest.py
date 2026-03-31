@@ -1123,9 +1123,9 @@ def _evaluate_position_on_bar(
         if tp_hit:
             return {
                 "position": position,
-                "exit_price": current_tp_unadjusted - TICK_SIZE,
+                "exit_price": current_tp_unadjusted,
                 "exit_reason": "tp",
-                "exit_fill_basis": "unadjusted_tp_minus_tick_exit",
+                "exit_fill_basis": "unadjusted_tp_limit_exit",
             }
         if not trail_is_active and float(bar["adj_low"]) <= position.initial_sl_adj:
             return {
@@ -1157,9 +1157,9 @@ def _evaluate_position_on_bar(
     if tp_hit:
         return {
             "position": position,
-            "exit_price": current_tp_unadjusted + TICK_SIZE,
+            "exit_price": current_tp_unadjusted,
             "exit_reason": "tp",
-            "exit_fill_basis": "unadjusted_tp_plus_tick_exit",
+            "exit_fill_basis": "unadjusted_tp_limit_exit",
         }
     if not trail_is_active and float(bar["adj_high"]) >= position.initial_sl_adj:
         return {
