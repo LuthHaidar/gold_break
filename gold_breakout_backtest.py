@@ -1131,31 +1131,16 @@ def _evaluate_position_on_bar(
     bar: pd.Series,
     config: BacktestConfig,
 ) -> dict[str, Any] | None:
-    atr_value = bar["atr"]
-    if pd.notna(atr_value):
-        if position.direction == "long":
-            position.highest_favorable_price_adj = max(
-                float(position.highest_favorable_price_adj),
-                float(bar["adj_high"]),
-            )
-            new_trail = position.highest_favorable_price_adj - (config.atr_multiplier * float(atr_value))
-            position.current_trail_stop_adj = max(position.current_trail_stop_adj, new_trail)
-        else:
-            position.lowest_favorable_price_adj = min(
-                float(position.lowest_favorable_price_adj),
-                float(bar["adj_low"]),
-            )
-            new_trail = position.lowest_favorable_price_adj + (config.atr_multiplier * float(atr_value))
-            position.current_trail_stop_adj = min(position.current_trail_stop_adj, new_trail)
-
+    active_trail_stop_adj = float(position.current_trail_stop_adj)
+    active_initial_sl_adj = float(position.initial_sl_adj)
     current_tp_unadjusted = position.tp_adj - float(bar["adj_factor"])
-    current_stop_unadjusted = position.current_trail_stop_adj - float(bar["adj_factor"])
-    initial_sl_unadjusted = position.initial_sl_adj - float(bar["adj_factor"])
-    trail_is_active = not np.isclose(position.current_trail_stop_adj, position.initial_sl_adj)
+    current_stop_unadjusted = active_trail_stop_adj - float(bar["adj_factor"])
+    initial_sl_unadjusted = active_initial_sl_adj - float(bar["adj_factor"])
+    trail_is_active = not np.isclose(active_trail_stop_adj, active_initial_sl_adj)
 
     if position.direction == "long":
         tp_hit = float(bar["adj_high"]) >= position.tp_adj
-        stop_hit = float(bar["adj_low"]) <= position.current_trail_stop_adj
+        stop_hit = float(bar["adj_low"]) <= active_trail_stop_adj
         if tp_hit and stop_hit:
             exit_reason = "trail_stop" if trail_is_active else "initial_sl"
             return {
@@ -1179,47 +1164,63 @@ def _evaluate_position_on_bar(
                 "exit_reason": "tp",
                 "exit_fill_basis": "unadjusted_tp_limit_exit",
             }
-        if not trail_is_active and float(bar["adj_low"]) <= position.initial_sl_adj:
+        if not trail_is_active and float(bar["adj_low"]) <= active_initial_sl_adj:
             return {
                 "position": position,
                 "exit_price": initial_sl_unadjusted - TICK_SIZE,
                 "exit_reason": "initial_sl",
                 "exit_fill_basis": "unadjusted_stop_minus_tick_exit",
             }
-        return None
+    else:
+        tp_hit = float(bar["adj_low"]) <= position.tp_adj
+        stop_hit = float(bar["adj_high"]) >= active_trail_stop_adj
+        if tp_hit and stop_hit:
+            exit_reason = "trail_stop" if trail_is_active else "initial_sl"
+            return {
+                "position": position,
+                "exit_price": current_stop_unadjusted + TICK_SIZE,
+                "exit_reason": exit_reason,
+                "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
+            }
+        if stop_hit:
+            exit_reason = "trail_stop" if trail_is_active else "initial_sl"
+            return {
+                "position": position,
+                "exit_price": current_stop_unadjusted + TICK_SIZE,
+                "exit_reason": exit_reason,
+                "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
+            }
+        if tp_hit:
+            return {
+                "position": position,
+                "exit_price": current_tp_unadjusted,
+                "exit_reason": "tp",
+                "exit_fill_basis": "unadjusted_tp_limit_exit",
+            }
+        if not trail_is_active and float(bar["adj_high"]) >= active_initial_sl_adj:
+            return {
+                "position": position,
+                "exit_price": initial_sl_unadjusted + TICK_SIZE,
+                "exit_reason": "initial_sl",
+                "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
+            }
 
-    tp_hit = float(bar["adj_low"]) <= position.tp_adj
-    stop_hit = float(bar["adj_high"]) >= position.current_trail_stop_adj
-    if tp_hit and stop_hit:
-        exit_reason = "trail_stop" if trail_is_active else "initial_sl"
-        return {
-            "position": position,
-            "exit_price": current_stop_unadjusted + TICK_SIZE,
-            "exit_reason": exit_reason,
-            "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
-        }
-    if stop_hit:
-        exit_reason = "trail_stop" if trail_is_active else "initial_sl"
-        return {
-            "position": position,
-            "exit_price": current_stop_unadjusted + TICK_SIZE,
-            "exit_reason": exit_reason,
-            "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
-        }
-    if tp_hit:
-        return {
-            "position": position,
-            "exit_price": current_tp_unadjusted,
-            "exit_reason": "tp",
-            "exit_fill_basis": "unadjusted_tp_limit_exit",
-        }
-    if not trail_is_active and float(bar["adj_high"]) >= position.initial_sl_adj:
-        return {
-            "position": position,
-            "exit_price": initial_sl_unadjusted + TICK_SIZE,
-            "exit_reason": "initial_sl",
-            "exit_fill_basis": "unadjusted_stop_plus_tick_exit",
-        }
+    atr_value = bar["atr"]
+    if pd.notna(atr_value):
+        if position.direction == "long":
+            position.highest_favorable_price_adj = max(
+                float(position.highest_favorable_price_adj),
+                float(bar["adj_high"]),
+            )
+            new_trail = position.highest_favorable_price_adj - (config.atr_multiplier * float(atr_value))
+            position.current_trail_stop_adj = max(position.current_trail_stop_adj, new_trail)
+        else:
+            position.lowest_favorable_price_adj = min(
+                float(position.lowest_favorable_price_adj),
+                float(bar["adj_low"]),
+            )
+            new_trail = position.lowest_favorable_price_adj + (config.atr_multiplier * float(atr_value))
+            position.current_trail_stop_adj = min(position.current_trail_stop_adj, new_trail)
     return None
 
 
