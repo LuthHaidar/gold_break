@@ -2773,6 +2773,126 @@ def plot_drawdown_curve(result: BacktestResult) -> plt.Figure:
     return fig
 
 
+def _build_directional_trade_curves(
+    trade_log: pd.DataFrame,
+    starting_capital: float,
+) -> pd.DataFrame:
+    if trade_log.empty:
+        return pd.DataFrame(
+            columns=[
+                "ts_event",
+                "net_pnl",
+                "cumulative_net_pnl",
+                "net_equity",
+                "running_peak_equity",
+                "drawdown_pct",
+                "direction",
+            ]
+        )
+    normalized = trade_log[["exit_bar_ts", "direction", "net_pnl"]].copy()
+    normalized["ts_event"] = pd.to_datetime(normalized["exit_bar_ts"], utc=True, errors="coerce")
+    normalized = normalized.dropna(subset=["ts_event", "net_pnl"]).sort_values("ts_event").reset_index(drop=True)
+    curve_frames: list[pd.DataFrame] = []
+    for direction in ["total", "long", "short"]:
+        subset = normalized if direction == "total" else normalized.loc[normalized["direction"] == direction]
+        if subset.empty:
+            continue
+        grouped = (
+            subset.groupby("ts_event", as_index=False)["net_pnl"].sum().sort_values("ts_event").reset_index(drop=True)
+        )
+        seed_row = pd.DataFrame(
+            {
+                "ts_event": [grouped["ts_event"].iloc[0] - pd.Timedelta(minutes=1)],
+                "net_pnl": [0.0],
+            }
+        )
+        grouped = pd.concat([seed_row, grouped], ignore_index=True)
+        grouped["cumulative_net_pnl"] = grouped["net_pnl"].cumsum()
+        grouped["net_equity"] = starting_capital + grouped["cumulative_net_pnl"]
+        grouped["running_peak_equity"] = np.maximum.accumulate(
+            grouped["net_equity"].to_numpy(dtype=float)
+        )
+        grouped["drawdown_pct"] = 100.0 * (
+            grouped["net_equity"] / grouped["running_peak_equity"] - 1.0
+        )
+        grouped["direction"] = direction
+        curve_frames.append(grouped)
+    return pd.concat(curve_frames, ignore_index=True) if curve_frames else pd.DataFrame()
+
+
+def plot_directional_equity_curves(result: BacktestResult) -> plt.Figure:
+    directional_curves = _build_directional_trade_curves(
+        trade_log=result.trade_log,
+        starting_capital=result.config.starting_capital,
+    )
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    if directional_curves.empty:
+        ax.text(0.5, 0.5, "No closed trades available for directional attribution.", ha="center", va="center")
+        ax.set_axis_off()
+        fig.tight_layout()
+        return fig
+    style_map = {
+        "total": {"color": "black", "linewidth": 1.8, "linestyle": "-", "label": "Total strategy"},
+        "long": {"color": "forestgreen", "linewidth": 1.4, "linestyle": "--", "label": "Long-only"},
+        "short": {"color": "maroon", "linewidth": 1.4, "linestyle": "--", "label": "Short-only"},
+    }
+    for direction in ["total", "long", "short"]:
+        subset = directional_curves.loc[directional_curves["direction"] == direction].copy()
+        if subset.empty:
+            continue
+        ax.plot(
+            subset["ts_event"],
+            subset["net_equity"],
+            color=style_map[direction]["color"],
+            linewidth=style_map[direction]["linewidth"],
+            linestyle=style_map[direction]["linestyle"],
+            label=style_map[direction]["label"],
+        )
+    ax.axhline(result.config.starting_capital, color="grey", linewidth=1.0, alpha=0.5, linestyle=":")
+    ax.set_title("Directional Net Equity Attribution")
+    ax.set_ylabel("Equity")
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_directional_drawdown_curves(result: BacktestResult) -> plt.Figure:
+    directional_curves = _build_directional_trade_curves(
+        trade_log=result.trade_log,
+        starting_capital=result.config.starting_capital,
+    )
+    fig, ax = plt.subplots(figsize=(12, 4.0))
+    if directional_curves.empty:
+        ax.text(0.5, 0.5, "No closed trades available for directional attribution.", ha="center", va="center")
+        ax.set_axis_off()
+        fig.tight_layout()
+        return fig
+    style_map = {
+        "total": {"color": "black", "linewidth": 1.8, "linestyle": "-", "label": "Total strategy"},
+        "long": {"color": "forestgreen", "linewidth": 1.4, "linestyle": "--", "label": "Long-only"},
+        "short": {"color": "maroon", "linewidth": 1.4, "linestyle": "--", "label": "Short-only"},
+    }
+    for direction in ["total", "long", "short"]:
+        subset = directional_curves.loc[directional_curves["direction"] == direction].copy()
+        if subset.empty:
+            continue
+        ax.plot(
+            subset["ts_event"],
+            subset["drawdown_pct"],
+            color=style_map[direction]["color"],
+            linewidth=style_map[direction]["linewidth"],
+            linestyle=style_map[direction]["linestyle"],
+            label=style_map[direction]["label"],
+        )
+    ax.set_title("Directional Drawdown Attribution")
+    ax.set_ylabel("Drawdown %")
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
 def plot_monthly_returns_heatmap(result: BacktestResult) -> plt.Figure:
     session_equity = result.session_equity.copy()
     monthly = (
