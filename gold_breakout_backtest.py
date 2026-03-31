@@ -102,6 +102,7 @@ class PreparedData:
     session_table: pd.DataFrame
     dominant_table: pd.DataFrame
     continuous_data: pd.DataFrame
+    atr_source_data: pd.DataFrame
     audit: dict[str, Any]
     notes: list[str]
 
@@ -270,6 +271,10 @@ def prepare_research_data(config: BacktestConfig) -> PreparedData:
             f"Configurable defaults chosen for missing plan parameters: fixed_ticks={config.fixed_ticks}, "
             f"atr_multiplier_tpsl={config.atr_multiplier_tpsl}."
         ),
+        (
+            "ATR is always warmed up on the full pre-sample feature history before the active "
+            "backtest window is filtered, and all ATR-period recomputations reuse that same source."
+        ),
     ]
     raw = _load_csv(config)
     clean = _clean_outright_data(raw, config, audit)
@@ -281,7 +286,8 @@ def prepare_research_data(config: BacktestConfig) -> PreparedData:
     dominant_table, continuous = _build_continuous_series(clean, session_table, audit)
     continuous = _attach_session_features(continuous)
     continuous = _attach_true_range(continuous)
-    continuous = _attach_atr(continuous, config.atr_period)
+    atr_source_data = continuous.reset_index(drop=True)
+    continuous = _attach_atr(atr_source_data, config.atr_period)
     filtered_sessions, filtered_continuous = _filter_backtest_window(
         session_table=dominant_table,
         continuous=continuous,
@@ -292,20 +298,23 @@ def prepare_research_data(config: BacktestConfig) -> PreparedData:
         session_table=filtered_sessions.reset_index(drop=True),
         dominant_table=dominant_table.reset_index(drop=True),
         continuous_data=filtered_continuous.reset_index(drop=True),
+        atr_source_data=atr_source_data,
         audit=audit,
         notes=notes,
     )
 
 
 def with_atr_period(prepared: PreparedData, atr_period: int) -> PreparedData:
-    data = _attach_atr(prepared.continuous_data, atr_period)
-    session_ids = data["session_id"].drop_duplicates()
+    source_with_atr = _attach_atr(prepared.atr_source_data, atr_period)
+    session_ids = prepared.session_table["session_id"].tolist()
+    data = source_with_atr.loc[source_with_atr["session_id"].isin(session_ids)].copy()
     session_table = prepared.session_table[prepared.session_table["session_id"].isin(session_ids)].copy()
     return PreparedData(
         clean_data=prepared.clean_data,
         session_table=session_table.reset_index(drop=True),
         dominant_table=prepared.dominant_table,
         continuous_data=data.reset_index(drop=True),
+        atr_source_data=prepared.atr_source_data,
         audit=prepared.audit,
         notes=prepared.notes,
     )
@@ -1666,6 +1675,25 @@ def run_validations(
             "test": "ATR temporal integrity",
             "status": "pass" if atr_temporal_ok else "fail",
             "detail": "Shifted ATR equals the one-bar-lagged Wilder ATR series.",
+        }
+    )
+
+    atr_warmup_ok = True
+    if not data.empty:
+        recomputed = with_atr_period(prepared, config.atr_period).continuous_data
+        atr_warmup_ok = bool(
+            data["ts_event"].equals(recomputed["ts_event"])
+            and np.allclose(
+                data["atr"].to_numpy(dtype=float),
+                recomputed["atr"].to_numpy(dtype=float),
+                equal_nan=True,
+            )
+        )
+    validations.append(
+        {
+            "test": "ATR warm-up consistency",
+            "status": "pass" if atr_warmup_ok else "fail",
+            "detail": "ATR recomputation for the configured period reuses the full pre-sample source history.",
         }
     )
 
