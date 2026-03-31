@@ -1,0 +1,5 @@
+*
+!/.gitignore
+!/gold_breakout_backtest.ipynb
+!gold_breakout_backtest.py
+# Ignore all other files
