@@ -1,42 +1,110 @@
 from __future__ import annotations
-
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.animation import FuncAnimation
+
+import gold_breakout_backtest as historical_backtest
 
 
 VALID_TP_SL_MODES = ("symmetric_fixed", "atr_based", "prior_day_range")
+VALID_WALK_FORWARD_OBJECTIVES = ("sharpe_ratio", "total_return_pct", "calmar_ratio")
 TICK_SIZE = 0.10
 TICK_VALUE = 10.00
 CONTRACT_MULTIPLIER = 100.0
+ROUND_TURN_COST = 24.74
 
 
 @dataclass(frozen=True)
 class RecentIntrabarConfig:
-    ticker: str = "GC=F"
-    period: str = "7d"
-    interval: str = "1m"
-    cache_dir: Path = Path("cache") / "yfinance_intrabar_recent"
-    session_gap_threshold_minutes: int = 30
+    csv_path: Path = Path("glbx-mdp3-20250330-20260329.ohlcv-1m.csv")
+    backtest_start_session_date: str = "2025-03-30"
+    max_ohlc_violations: int = 0
+    min_session_volume: int = 0
+    accepted_rtypes: tuple[int, ...] = (33, 34)
 
-    def cache_key(self) -> str:
-        safe_ticker = (
-            self.ticker.replace("=", "_")
-            .replace("/", "_")
-            .replace("^", "_")
-            .replace(":", "_")
-        )
-        return f"{safe_ticker}_{self.period}_{self.interval}"
+    def resolved_start_session_date(self) -> pd.Timestamp:
+        return pd.Timestamp(self.backtest_start_session_date, tz="UTC").normalize()
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["cache_dir"] = str(self.cache_dir)
+        payload["csv_path"] = str(self.csv_path)
         return payload
+
+
+@dataclass(frozen=True)
+class RecentIntrabarReplayConfig:
+    tp_sl_mode: str = "prior_day_range"
+    fixed_ticks: int = 100
+    atr_multiplier_tpsl: float = 2.0
+    k: float = 0.50
+    atr_period: int = 14
+    atr_multiplier: float = 1.5
+    starting_capital: float = 100_000.0
+    risk_free_rate: float = 0.0
+    round_turn_cost: float = ROUND_TURN_COST
+    allow_independent_long_short: bool = True
+    close_positions_at_session_end: bool = True
+    frame_step: int = 5
+    animation_interval_ms: int = 120
+    sensitivity_atr_periods: tuple[int, ...] = (7, 14, 21)
+    sensitivity_atr_multipliers: tuple[float, ...] = (0.25, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0)
+    sensitivity_ks: tuple[float, ...] = (0.10, 0.15, 0.25, 0.50, 0.75, 1.00)
+    sensitivity_tp_sl_modes: tuple[str, ...] = VALID_TP_SL_MODES
+    walk_forward_objective: str = "sharpe_ratio"
+    walk_forward_train_months: int = 6
+    walk_forward_test_months: int = 1
+    walk_forward_step_months: int = 1
+    walk_forward_atr_periods: tuple[int, ...] = (14,)
+    walk_forward_tp_sl_modes: tuple[str, ...] = ("prior_day_range",)
+    walk_forward_atr_multipliers: tuple[float, ...] = (0.50, 0.75, 1.0, 1.5)
+    walk_forward_ks: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RecentIntrabarResult:
+    config: RecentIntrabarReplayConfig
+    data: pd.DataFrame
+    session_table: pd.DataFrame
+    trade_log: pd.DataFrame
+    roll_events: pd.DataFrame
+    order_cancellations: pd.DataFrame
+    floor_events: pd.DataFrame
+    margin_flags: pd.DataFrame
+    skipped_sessions: pd.DataFrame
+    event_log: pd.DataFrame
+    equity_curve: pd.DataFrame
+    session_equity: pd.DataFrame
+    performance_summary: pd.Series
+    direction_summary: pd.DataFrame
+    annual_summary: pd.DataFrame
+    exit_breakdown: pd.DataFrame
+    benchmark_curves: pd.DataFrame
+    benchmark_summary: pd.DataFrame
+    validation_results: pd.DataFrame
+    diagnostics: dict[str, Any]
+    frame_state: pd.DataFrame
+    session_summary: pd.DataFrame
+
+
+@dataclass
+class RecentIntrabarWalkForwardResult:
+    config: RecentIntrabarReplayConfig
+    fold_summary: pd.DataFrame
+    optimization_results: pd.DataFrame
+    parameter_stability: pd.DataFrame
+    oos_equity_curve: pd.DataFrame
+    oos_session_equity: pd.DataFrame
+    oos_trade_log: pd.DataFrame
+    diagnostics: dict[str, Any]
+
 
 @dataclass
 class IntrabarPositionState:
@@ -57,6 +125,16 @@ class IntrabarPositionState:
     bars_held: int = 0
 
 
+def make_default_recent_intrabar_replay_config(**overrides: Any) -> RecentIntrabarReplayConfig:
+    base = RecentIntrabarReplayConfig()
+    return replace(base, **overrides)
+
+
+def make_default_recent_intrabar_config(**overrides: Any) -> RecentIntrabarConfig:
+    base = RecentIntrabarConfig()
+    return replace(base, **overrides)
+
+
 def recent_intrabar_config_frame(config: RecentIntrabarConfig) -> pd.DataFrame:
     payload = config.to_dict()
     return pd.DataFrame({"parameter": list(payload.keys()), "value": list(payload.values())})
@@ -67,178 +145,154 @@ def recent_intrabar_replay_config_frame(config: RecentIntrabarReplayConfig) -> p
     return pd.DataFrame({"parameter": list(payload.keys()), "value": list(payload.values())})
 
 
+def _validate_replay_config(config: RecentIntrabarReplayConfig) -> None:
+    if config.tp_sl_mode not in VALID_TP_SL_MODES:
+        raise ValueError(f"Unsupported tp_sl_mode: {config.tp_sl_mode}")
+    if config.walk_forward_objective not in VALID_WALK_FORWARD_OBJECTIVES:
+        raise ValueError(f"Unsupported walk_forward_objective: {config.walk_forward_objective}")
+    if config.fixed_ticks <= 0:
+        raise ValueError("fixed_ticks must be positive.")
+    if config.atr_multiplier_tpsl <= 0:
+        raise ValueError("atr_multiplier_tpsl must be positive.")
+    if config.k <= 0:
+        raise ValueError("k must be positive.")
+    if config.atr_period <= 0:
+        raise ValueError("atr_period must be positive.")
+    if config.atr_multiplier <= 0:
+        raise ValueError("atr_multiplier must be positive.")
+    if config.starting_capital <= 0:
+        raise ValueError("starting_capital must be positive.")
+    if config.round_turn_cost < 0:
+        raise ValueError("round_turn_cost cannot be negative.")
+    if config.frame_step <= 0:
+        raise ValueError("frame_step must be positive.")
+    if config.animation_interval_ms <= 0:
+        raise ValueError("animation_interval_ms must be positive.")
+    if any(period <= 0 for period in config.sensitivity_atr_periods):
+        raise ValueError("All sensitivity_atr_periods values must be positive.")
+    if any(multiplier <= 0 for multiplier in config.sensitivity_atr_multipliers):
+        raise ValueError("All sensitivity_atr_multipliers values must be positive.")
+    if any(k_value <= 0 for k_value in config.sensitivity_ks):
+        raise ValueError("All sensitivity_ks values must be positive.")
+    if any(mode not in VALID_TP_SL_MODES for mode in config.sensitivity_tp_sl_modes):
+        raise ValueError("sensitivity_tp_sl_modes contains an unsupported mode.")
+    if config.walk_forward_train_months <= 0:
+        raise ValueError("walk_forward_train_months must be positive.")
+    if config.walk_forward_test_months <= 0:
+        raise ValueError("walk_forward_test_months must be positive.")
+    if config.walk_forward_step_months <= 0:
+        raise ValueError("walk_forward_step_months must be positive.")
+    if config.walk_forward_step_months < config.walk_forward_test_months:
+        raise ValueError("walk_forward_step_months must be at least the walk-forward test horizon in months.")
+    if any(period <= 0 for period in config.walk_forward_atr_periods):
+        raise ValueError("All walk_forward_atr_periods values must be positive.")
+    if any(mode not in VALID_TP_SL_MODES for mode in config.walk_forward_tp_sl_modes):
+        raise ValueError("walk_forward_tp_sl_modes contains an unsupported mode.")
+    if any(multiplier <= 0 for multiplier in config.walk_forward_atr_multipliers):
+        raise ValueError("All walk_forward_atr_multipliers values must be positive.")
+    if any(k_value <= 0 for k_value in config.walk_forward_ks):
+        raise ValueError("All walk_forward_ks values must be positive.")
+
+
+def _validate_intrabar_config(config: RecentIntrabarConfig) -> None:
+    if not config.csv_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {config.csv_path}")
+    if config.max_ohlc_violations < 0:
+        raise ValueError("max_ohlc_violations cannot be negative.")
+    if config.min_session_volume < 0:
+        raise ValueError("min_session_volume cannot be negative.")
+    if not config.accepted_rtypes:
+        raise ValueError("accepted_rtypes cannot be empty.")
+
+
+def recent_intrabar_data_paths(config: RecentIntrabarConfig) -> dict[str, Path]:
+    return {"csv_path": config.csv_path}
+
+
 def recent_intrabar_cache_paths(config: RecentIntrabarConfig) -> dict[str, Path]:
-    cache_key = config.cache_key()
-    return {
-        "bars_csv": config.cache_dir / f"{cache_key}.csv",
-        "metadata_json": config.cache_dir / f"{cache_key}.metadata.json",
-    }
+    return recent_intrabar_data_paths(config)
 
 
-def _normalize_yfinance_frame(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    if raw.empty:
-        raise ValueError("yfinance returned no rows for the requested recent intraday sample.")
-    df = raw.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        if ticker in df.columns.get_level_values(-1):
-            df = df.xs(ticker, axis=1, level=-1)
-        else:
-            df.columns = df.columns.get_level_values(0)
-    df = df.reset_index()
-    timestamp_column = df.columns[0]
-    normalized_map = {
-        str(column).lower().replace(" ", "_"): column for column in df.columns
-    }
-    required_columns = {
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "adj_close": "adj_close",
-        "volume": "volume",
-    }
-    rename_map = {timestamp_column: "ts_event"}
-    for source_name, target_name in required_columns.items():
-        source_column = normalized_map.get(source_name)
-        if source_column is None:
-            if source_name == "adj_close" and normalized_map.get("close") is not None:
-                continue
-            raise ValueError(f"Missing required yfinance column: {source_name}")
-        rename_map[source_column] = target_name
-    df = df.rename(columns=rename_map)
-    if "adj_close" not in df.columns:
-        df["adj_close"] = df["close"]
-    ts_event = pd.to_datetime(df["ts_event"], errors="raise")
-    if ts_event.dt.tz is None:
-        ts_event = ts_event.dt.tz_localize("UTC")
-    else:
-        ts_event = ts_event.dt.tz_convert("UTC")
-    df["ts_event"] = ts_event
-    df["ticker"] = ticker
-    numeric_columns = ["open", "high", "low", "close", "adj_close", "volume"]
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-    df = df.dropna(subset=["ts_event", "open", "high", "low", "close", "volume"]).copy()
-    return df[
-        ["ts_event", "ticker", "open", "high", "low", "close", "adj_close", "volume"]
-    ].sort_values("ts_event").reset_index(drop=True)
+def summarize_intrabar_audit(audit: dict[str, Any]) -> pd.DataFrame:
+    return historical_backtest.summarize_audit(audit)
 
 
-def _load_cached_intraday_data(config: RecentIntrabarConfig) -> tuple[pd.DataFrame, dict[str, Any]] | None:
-    cache_paths = recent_intrabar_cache_paths(config)
-    if not cache_paths["bars_csv"].exists() or not cache_paths["metadata_json"].exists():
-        return None
-    bars = pd.read_csv(cache_paths["bars_csv"])
-    bars["ts_event"] = pd.to_datetime(bars["ts_event"], utc=True, errors="raise")
-    metadata = json.loads(cache_paths["metadata_json"].read_text(encoding="utf-8"))
-    metadata["cache_hit"] = True
-    return bars, metadata
-
-
-def _write_intraday_cache(
-    config: RecentIntrabarConfig,
-    bars: pd.DataFrame,
-    metadata: dict[str, Any],
-) -> None:
-    cache_paths = recent_intrabar_cache_paths(config)
-    config.cache_dir.mkdir(parents=True, exist_ok=True)
-    bars.to_csv(cache_paths["bars_csv"], index=False)
-    cache_paths["metadata_json"].write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-
-def _import_yfinance() -> Any:
-    try:
-        import yfinance as yf  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "yfinance is required for the recent intrabar notebook. Install it with `pip install yfinance`."
-        ) from exc
-    return yf
-
-
-def load_recent_intraday_data(
-    config: RecentIntrabarConfig,
-    force_refresh: bool = False,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    if not force_refresh:
-        cached = _load_cached_intraday_data(config)
-        if cached is not None:
-            return cached
-
-    yf = _import_yfinance()
-    raw = yf.download(
-        tickers=config.ticker,
-        period=config.period,
-        interval=config.interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+def _proxy_backtest_config(config: RecentIntrabarConfig, atr_period: int = 14) -> historical_backtest.BacktestConfig:
+    return historical_backtest.make_default_config(
+        csv_path=config.csv_path,
+        backtest_start_session_date=config.backtest_start_session_date,
+        max_ohlc_violations=config.max_ohlc_violations,
+        min_session_volume=config.min_session_volume,
+        atr_period=atr_period,
     )
-    bars = _normalize_yfinance_frame(raw, config.ticker)
+
+
+def _load_local_minute_csv(config: RecentIntrabarConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
+    _validate_intrabar_config(config)
+    raw = historical_backtest._load_csv(_proxy_backtest_config(config))
+    accepted_mask = raw["rtype"].isin(config.accepted_rtypes)
+    accepted_rows = raw.loc[accepted_mask].copy()
+    if accepted_rows.empty:
+        raise ValueError(
+            f"No rows matched accepted_rtypes={config.accepted_rtypes} in {config.csv_path.name}."
+        )
+    accepted_rows["rtype"] = 34
     metadata = {
-        "source": "yfinance",
-        "ticker": config.ticker,
-        "period": config.period,
-        "interval": config.interval,
-        "rows": int(bars.shape[0]),
-        "downloaded_at_utc": pd.Timestamp.utcnow().isoformat(),
-        "ts_min": bars["ts_event"].min().isoformat() if not bars.empty else None,
-        "ts_max": bars["ts_event"].max().isoformat() if not bars.empty else None,
-        "cache_hit": False,
+        "source": "local_csv",
+        "csv_path": str(config.csv_path),
+        "rows_raw": int(raw.shape[0]),
+        "rows_after_rtype_filter": int(accepted_rows.shape[0]),
+        "accepted_rtypes": list(config.accepted_rtypes),
+        "ts_min": accepted_rows["ts_event"].min().isoformat() if not accepted_rows.empty else None,
+        "ts_max": accepted_rows["ts_event"].max().isoformat() if not accepted_rows.empty else None,
+        "backtest_start_session_date": config.backtest_start_session_date,
     }
-    _write_intraday_cache(config, bars, metadata)
-    return bars, metadata
+    return accepted_rows, metadata
 
 
-def assign_intraday_sessions(
-    minute_bars: pd.DataFrame,
-    session_gap_threshold_minutes: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if minute_bars.empty:
-        empty_sessions = pd.DataFrame(
+def _build_intrabar_minute_bars_from_continuous(continuous_data: pd.DataFrame) -> pd.DataFrame:
+    if continuous_data.empty:
+        return pd.DataFrame(
             columns=[
+                "ts_event",
+                "ticker",
+                "open",
+                "high",
+                "low",
+                "close",
+                "adj_close",
+                "volume",
                 "session_id",
+                "session_date",
                 "session_open_ts",
                 "session_close_ts",
-                "session_date",
-                "session_bars",
-                "session_high",
-                "session_low",
-                "session_open",
-                "session_close",
-                "session_volume",
+                "session_open_bar",
+                "session_close_bar",
+                "dominant_contract",
+                "adj_factor",
             ]
         )
-        return empty_sessions, minute_bars.copy()
-    df = minute_bars.sort_values("ts_event").reset_index(drop=True).copy()
-    gap_threshold = pd.Timedelta(minutes=session_gap_threshold_minutes)
-    session_start = df["ts_event"].diff().isna() | df["ts_event"].diff().gt(gap_threshold)
-    df["session_id"] = session_start.cumsum().astype(int) - 1
-    session_table = (
-        df.groupby("session_id", as_index=False)
-        .agg(
-            session_open_ts=("ts_event", "min"),
-            session_close_ts=("ts_event", "max"),
-            session_bars=("ts_event", "count"),
-            session_open=("open", "first"),
-            session_high=("high", "max"),
-            session_low=("low", "min"),
-            session_close=("close", "last"),
-            session_volume=("volume", "sum"),
-        )
-        .sort_values("session_id")
-        .reset_index(drop=True)
+    minute_bars = pd.DataFrame(
+        {
+            "ts_event": continuous_data["ts_event"],
+            "ticker": continuous_data["dominant_contract"],
+            "open": continuous_data["adj_open"],
+            "high": continuous_data["adj_high"],
+            "low": continuous_data["adj_low"],
+            "close": continuous_data["adj_close"],
+            "adj_close": continuous_data["adj_close"],
+            "volume": continuous_data["volume"],
+            "session_id": continuous_data["session_id"],
+            "session_date": continuous_data["session_date"],
+            "session_open_ts": continuous_data["session_open_ts"],
+            "session_close_ts": continuous_data["session_close_ts"],
+            "session_open_bar": continuous_data["session_open_bar"],
+            "session_close_bar": continuous_data["session_close_bar"],
+            "dominant_contract": continuous_data["dominant_contract"],
+            "adj_factor": continuous_data["adj_factor"],
+        }
     )
-    session_table["session_date"] = session_table["session_open_ts"].dt.normalize()
-    df = df.merge(
-        session_table[["session_id", "session_open_ts", "session_close_ts", "session_date"]],
-        on="session_id",
-        how="left",
-        validate="many_to_one",
-    )
-    df["session_open_bar"] = df["ts_event"].eq(df["session_open_ts"])
-    df["session_close_bar"] = df["ts_event"].eq(df["session_close_ts"])
-    return session_table, df.reset_index(drop=True)
+    return minute_bars.sort_values("ts_event").reset_index(drop=True)
 
 
 def resample_intraday_to_hourly(minute_bars: pd.DataFrame) -> pd.DataFrame:
@@ -277,6 +331,75 @@ def resample_intraday_to_hourly(minute_bars: pd.DataFrame) -> pd.DataFrame:
     return hourly
 
 
+def forward_fill_intraday_hourly_gaps(
+    hourly_bars: pd.DataFrame,
+    session_table: pd.DataFrame,
+) -> pd.DataFrame:
+    if session_table.empty:
+        return pd.DataFrame(
+            columns=[
+                "session_id",
+                "session_date",
+                "ts_event",
+                "minute_count",
+                "open",
+                "high",
+                "low",
+                "close",
+                "adj_close",
+                "volume",
+                "forward_filled",
+            ]
+        )
+
+    session_frames: list[pd.DataFrame] = []
+    for session_row in session_table.itertuples(index=False):
+        session_hourly = (
+            hourly_bars.loc[hourly_bars["session_id"].eq(session_row.session_id)]
+            .sort_values("ts_event")
+            .reset_index(drop=True)
+        )
+        session_index = pd.date_range(
+            start=pd.Timestamp(session_row.session_open_ts).floor("h"),
+            end=pd.Timestamp(session_row.session_close_ts).floor("h"),
+            freq="h",
+            tz="UTC",
+        )
+        session_grid = pd.DataFrame({"ts_event": session_index})
+        merged = session_grid.merge(
+            session_hourly,
+            on="ts_event",
+            how="left",
+            validate="one_to_one",
+        )
+        merged["session_id"] = int(session_row.session_id)
+        merged["session_date"] = pd.Timestamp(session_row.session_date)
+        merged["forward_filled"] = merged["open"].isna()
+        merged["adj_close"] = merged["adj_close"].ffill().bfill()
+        for column in ["close", "open", "high", "low"]:
+            merged[column] = merged[column].fillna(merged["adj_close"])
+        merged["minute_count"] = merged["minute_count"].fillna(0).astype(int)
+        merged["volume"] = merged["volume"].fillna(0.0)
+        session_frames.append(
+            merged[
+                [
+                    "session_id",
+                    "session_date",
+                    "ts_event",
+                    "minute_count",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "adj_close",
+                    "volume",
+                    "forward_filled",
+                ]
+            ]
+        )
+    return pd.concat(session_frames, ignore_index=True) if session_frames else pd.DataFrame()
+
+
 def _wilder_atr(true_range: pd.Series, period: int) -> pd.Series:
     values = true_range.astype(float).to_numpy()
     atr = np.full(values.shape, np.nan, dtype=float)
@@ -309,6 +432,7 @@ def _prepare_intrabar_strategy_bars(
     minute_bars: pd.DataFrame,
     replay_config: RecentIntrabarReplayConfig,
 ) -> pd.DataFrame:
+    _validate_replay_config(replay_config)
     if replay_config.tp_sl_mode not in VALID_TP_SL_MODES:
         raise ValueError(f"Unsupported tp_sl_mode: {replay_config.tp_sl_mode}")
     if minute_bars.empty:
@@ -359,23 +483,102 @@ def _prepare_intrabar_strategy_bars(
     return df.reset_index(drop=True)
 
 
+def prepare_recent_intrabar_feature_data(
+    context: dict[str, Any],
+    replay_config: RecentIntrabarReplayConfig,
+) -> pd.DataFrame:
+    return _prepare_intrabar_strategy_bars(context["minute_bars"], replay_config)
+
+
+def preview_intrabar_signal_inputs(
+    context: dict[str, Any],
+    replay_config: RecentIntrabarReplayConfig,
+    rows: int = 15,
+) -> pd.DataFrame:
+    feature_data = prepare_recent_intrabar_feature_data(context, replay_config)
+    if feature_data.empty:
+        return pd.DataFrame()
+    preview = (
+        feature_data.loc[feature_data["session_open_bar"]]
+        .copy()
+        .sort_values("ts_event")
+        .reset_index(drop=True)
+    )
+    preview["buy_stop"] = preview["prev_session_high"]
+    preview["sell_stop"] = preview["prev_session_low"]
+    columns = [
+        "ts_event",
+        "session_id",
+        "session_date",
+        "buy_stop",
+        "sell_stop",
+        "prev_session_range",
+        "atr",
+        "sl_distance_price",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+    available = [column for column in columns if column in preview.columns]
+    return preview[available].head(rows)
+
+
 def build_recent_intrabar_context(
     config: RecentIntrabarConfig,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
-    minute_bars, metadata = load_recent_intraday_data(config, force_refresh=force_refresh)
-    session_table, session_bars = assign_intraday_sessions(
-        minute_bars=minute_bars,
-        session_gap_threshold_minutes=config.session_gap_threshold_minutes,
+    del force_refresh
+    raw, metadata = _load_local_minute_csv(config)
+    audit: dict[str, Any] = {"counts": {}, "frames": {}, "lists": {}}
+    proxy_config = _proxy_backtest_config(config)
+    clean = historical_backtest._clean_outright_data(raw, proxy_config, audit)
+    session_table_all, clean = historical_backtest._assign_sessions(clean)
+    audit["counts"]["session_count_all_outrights"] = int(session_table_all.shape[0])
+    audit["frames"]["low_volume_sessions_all_outrights"] = historical_backtest._flag_low_volume_sessions(
+        session_table_all,
+        config.min_session_volume,
     )
-    hourly_bars = resample_intraday_to_hourly(session_bars)
+    dominant_table, continuous = historical_backtest._build_continuous_series(clean, session_table_all, audit)
+    continuous = historical_backtest._attach_session_features(continuous)
+    filtered_sessions, filtered_continuous = historical_backtest._filter_backtest_window(
+        session_table=dominant_table,
+        continuous=continuous,
+        start_session_date=config.resolved_start_session_date(),
+    )
+    minute_bars = _build_intrabar_minute_bars_from_continuous(filtered_continuous)
+    hourly_bars = resample_intraday_to_hourly(minute_bars)
+    hourly_bars_forward_filled = forward_fill_intraday_hourly_gaps(hourly_bars, filtered_sessions)
+    notes = [
+        "Minute data comes from the local Databento-style CSV, not yfinance.",
+        "Rows with accepted minute-bar rtypes are normalized onto the historical cleaning pipeline before spread removal and dominant-contract selection.",
+        "Intrabar replay runs on adjusted minute OHLC values from the continuous series. Because positions are flattened by session end, the per-trade PnL impact of the constant adjustment offset cancels within a session.",
+        "The forward-filled hourly table is a diagnostic resample only; the execution engine remains minute-based.",
+    ]
+    metadata.update(
+        {
+            "rows_clean": int(clean.shape[0]),
+            "rows_continuous": int(filtered_continuous.shape[0]),
+            "rows_minute_bars": int(minute_bars.shape[0]),
+            "session_count": int(filtered_sessions.shape[0]),
+            "dominant_contracts": int(filtered_sessions["dominant_contract"].nunique()) if not filtered_sessions.empty else 0,
+        }
+    )
     return {
         "config": config,
         "metadata": metadata,
-        "cache_paths": recent_intrabar_cache_paths(config),
-        "minute_bars": session_bars,
-        "session_table": session_table,
+        "data_paths": recent_intrabar_data_paths(config),
+        "raw_data": raw,
+        "clean_data": clean,
+        "audit": audit,
+        "notes": notes,
+        "minute_bars": minute_bars,
+        "session_table": filtered_sessions.reset_index(drop=True),
+        "dominant_table": dominant_table.reset_index(drop=True),
+        "continuous_data": filtered_continuous.reset_index(drop=True),
         "hourly_bars": hourly_bars,
+        "hourly_bars_forward_filled": hourly_bars_forward_filled,
     }
 
 
@@ -752,6 +955,752 @@ def simulate_intrabar_diagnostic(
     }
 
 
+def _build_intrabar_concurrency_log(frame_state: pd.DataFrame) -> pd.DataFrame:
+    if frame_state.empty:
+        return pd.DataFrame(
+            columns=[
+                "session_id",
+                "ts_event",
+                "open_positions",
+                "simultaneous_long_short",
+            ]
+        )
+    concurrency = (
+        frame_state[
+            [
+                "session_id",
+                "ts_event",
+                "long_position_open",
+                "short_position_open",
+            ]
+        ]
+        .copy()
+        .sort_values(["session_id", "ts_event"])
+        .reset_index(drop=True)
+    )
+    concurrency["open_positions"] = (
+        concurrency["long_position_open"].astype(int) + concurrency["short_position_open"].astype(int)
+    )
+    concurrency["simultaneous_long_short"] = (
+        concurrency["long_position_open"].astype(bool) & concurrency["short_position_open"].astype(bool)
+    )
+    return concurrency
+
+
+def _build_intrabar_equity_curve(
+    minute_bars: pd.DataFrame,
+    trade_log: pd.DataFrame,
+    starting_capital: float,
+) -> pd.DataFrame:
+    if minute_bars.empty:
+        return pd.DataFrame(
+            columns=[
+                "ts_event",
+                "session_id",
+                "session_date",
+                "session_open_bar",
+                "session_close_bar",
+                "gross_delta",
+                "net_delta",
+                "gross_equity",
+                "net_equity",
+                "gross_running_peak",
+                "net_running_peak",
+                "gross_drawdown_pct",
+                "net_drawdown_pct",
+            ]
+        )
+
+    curve = (
+        minute_bars[
+            [
+                "ts_event",
+                "session_id",
+                "session_date",
+                "session_open_bar",
+                "session_close_bar",
+            ]
+        ]
+        .copy()
+        .sort_values("ts_event")
+        .reset_index(drop=True)
+    )
+    curve["gross_delta"] = 0.0
+    curve["net_delta"] = 0.0
+    if not trade_log.empty:
+        realized = (
+            trade_log.groupby("exit_bar_ts", as_index=False)
+            .agg(
+                gross_delta=("gross_pnl", "sum"),
+                net_delta=("net_pnl", "sum"),
+            )
+            .rename(columns={"exit_bar_ts": "ts_event"})
+        )
+        curve = curve.merge(realized, on="ts_event", how="left", suffixes=("", "_realized"))
+        for column in ["gross_delta_realized", "net_delta_realized"]:
+            if column in curve.columns:
+                curve[column] = curve[column].fillna(0.0)
+        curve["gross_delta"] = curve.pop("gross_delta_realized")
+        curve["net_delta"] = curve.pop("net_delta_realized")
+    curve["gross_equity"] = starting_capital + curve["gross_delta"].cumsum()
+    curve["net_equity"] = starting_capital + curve["net_delta"].cumsum()
+    curve["gross_running_peak"] = curve["gross_equity"].cummax()
+    curve["net_running_peak"] = curve["net_equity"].cummax()
+    curve["gross_drawdown_pct"] = (
+        curve["gross_equity"] / curve["gross_running_peak"] - 1.0
+    ) * 100.0
+    curve["net_drawdown_pct"] = (
+        curve["net_equity"] / curve["net_running_peak"] - 1.0
+    ) * 100.0
+    return curve
+
+
+def _build_intrabar_gc_price_benchmark(
+    minute_bars: pd.DataFrame,
+    starting_capital: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if minute_bars.empty:
+        empty = pd.DataFrame(
+            columns=[
+                "ts_event",
+                "gc_price_index_equity",
+                "gc_price_index_running_peak",
+                "gc_price_index_drawdown_pct",
+                "session_close_bar",
+            ]
+        )
+        return empty, empty
+    benchmark = (
+        minute_bars[["ts_event", "adj_close", "session_close_bar"]]
+        .copy()
+        .sort_values("ts_event")
+        .reset_index(drop=True)
+    )
+    starting_price = float(benchmark["adj_close"].iloc[0])
+    benchmark["gc_price_index_equity"] = starting_capital * (benchmark["adj_close"] / starting_price)
+    benchmark["gc_price_index_running_peak"] = benchmark["gc_price_index_equity"].cummax()
+    benchmark["gc_price_index_drawdown_pct"] = (
+        benchmark["gc_price_index_equity"] / benchmark["gc_price_index_running_peak"] - 1.0
+    ) * 100.0
+    session_equity = benchmark.loc[benchmark["session_close_bar"]].copy().reset_index(drop=True)
+    return benchmark, session_equity
+
+
+def _build_recent_benchmark_summary(
+    strategy_session_equity: pd.DataFrame,
+    gc_price_session_equity: pd.DataFrame,
+    config: RecentIntrabarReplayConfig,
+) -> pd.DataFrame:
+    rows = [
+        historical_backtest._summarize_equity_series(
+            label="Strategy Net Equity",
+            session_equity=strategy_session_equity,
+            equity_column="net_equity",
+            starting_capital=config.starting_capital,
+            risk_free_rate=config.risk_free_rate,
+            strategy_session_equity=strategy_session_equity,
+        ),
+        historical_backtest._summarize_equity_series(
+            label="GC Price Index",
+            session_equity=gc_price_session_equity,
+            equity_column="gc_price_index_equity",
+            starting_capital=config.starting_capital,
+            risk_free_rate=config.risk_free_rate,
+            strategy_session_equity=strategy_session_equity,
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
+def _build_recent_validation_results(
+    result: RecentIntrabarResult,
+) -> pd.DataFrame:
+    validations: list[dict[str, Any]] = []
+    trades = result.trade_log.copy()
+    frame_state = result.frame_state.copy()
+
+    ordering_ok = True
+    if not trades.empty:
+        ordering_ok = bool(
+            pd.to_datetime(trades["entry_bar_ts"], utc=True).le(
+                pd.to_datetime(trades["exit_bar_ts"], utc=True)
+            ).all()
+        )
+    validations.append(
+        {
+            "test": "Trade timestamps are ordered",
+            "status": "pass" if ordering_ok else "fail",
+            "detail": "Each trade exits at or after its entry timestamp.",
+        }
+    )
+
+    equity_reconciles_ok = True
+    if not result.session_equity.empty:
+        expected_terminal = result.config.starting_capital + result.trade_log["net_pnl"].sum()
+        actual_terminal = float(result.session_equity["net_equity"].iloc[-1])
+        equity_reconciles_ok = bool(np.isclose(actual_terminal, expected_terminal, atol=1e-9))
+    validations.append(
+        {
+            "test": "Net equity reconciles to trade PnL",
+            "status": "pass" if equity_reconciles_ok else "fail",
+            "detail": "Terminal net equity equals starting capital plus cumulative trade net PnL.",
+        }
+    )
+
+    session_close_ok = True
+    if result.config.close_positions_at_session_end and not frame_state.empty:
+        session_end_frames = frame_state.groupby("session_id", as_index=False).tail(1)
+        session_close_ok = bool(
+            (~session_end_frames["long_position_open"].astype(bool)).all()
+            and (~session_end_frames["short_position_open"].astype(bool)).all()
+        )
+    validations.append(
+        {
+            "test": "Session-close flattening",
+            "status": "pass" if session_close_ok else "fail",
+            "detail": "No positions remain open at the final bar of a session when session-close exits are enabled.",
+        }
+    )
+
+    exit_count_ok = bool(
+        result.trade_log.shape[0]
+        == result.event_log.loc[result.event_log["event_type"].eq("exit")].shape[0]
+    )
+    validations.append(
+        {
+            "test": "Exit events reconcile to closed trades",
+            "status": "pass" if exit_count_ok else "fail",
+            "detail": "The event log contains one exit event for each closed trade.",
+        }
+    )
+    return pd.DataFrame(validations)
+
+
+def run_recent_intrabar_backtest(
+    context: dict[str, Any],
+    replay_config: RecentIntrabarReplayConfig,
+) -> RecentIntrabarResult:
+    _validate_replay_config(replay_config)
+    diagnostic = simulate_intrabar_diagnostic(context, replay_config)
+    minute_bars = diagnostic["minute_bars"].copy()
+    session_table = context["session_table"].copy()
+    trade_log = diagnostic["trade_log"].copy()
+    event_log = diagnostic["event_log"].copy()
+    if event_log.empty:
+        event_log = pd.DataFrame(
+            columns=[
+                "session_id",
+                "session_date",
+                "ts_event",
+                "trade_id",
+                "direction",
+                "event_type",
+                "event_reason",
+                "price",
+            ]
+        )
+    else:
+        event_log = event_log.sort_values("ts_event").reset_index(drop=True)
+    frame_state = diagnostic["frame_state"].copy()
+    if frame_state.empty:
+        frame_state = pd.DataFrame(
+            columns=[
+                "session_id",
+                "session_date",
+                "ts_event",
+                "bar_index",
+                "open",
+                "high",
+                "low",
+                "close",
+                "buy_stop",
+                "sell_stop",
+                "long_order_active",
+                "short_order_active",
+                "long_position_open",
+                "short_position_open",
+                "long_active_trail_stop",
+                "short_active_trail_stop",
+                "long_tp",
+                "short_tp",
+                "event_text",
+            ]
+        )
+    else:
+        frame_state = frame_state.sort_values(["session_id", "ts_event"]).reset_index(drop=True)
+    session_summary = diagnostic["session_summary"].copy()
+    if session_summary.empty:
+        session_summary = pd.DataFrame(
+            columns=[
+                "session_id",
+                "session_date",
+                "prev_session_high",
+                "prev_session_low",
+                "sl_distance_price",
+                "allow_independent_long_short",
+                "trade_count",
+                "entry_count",
+                "exit_count",
+                "net_pnl_usd",
+            ]
+        )
+    else:
+        session_summary = session_summary.sort_values("session_id").reset_index(drop=True)
+
+    trade_columns = [
+        "trade_id",
+        "session_id",
+        "session_date",
+        "direction",
+        "entry_ts",
+        "entry_bar_ts",
+        "entry_price",
+        "tp_price",
+        "initial_sl_price",
+        "exit_ts",
+        "exit_bar_ts",
+        "exit_price",
+        "exit_reason",
+        "exit_fill_basis",
+        "bars_held",
+        "pnl_usd",
+        "gross_pnl",
+        "trade_cost",
+        "net_pnl",
+        "mfe_price",
+        "mae_price",
+        "mfe_usd",
+        "mae_usd",
+    ]
+    if trade_log.empty:
+        trade_log = pd.DataFrame(columns=trade_columns)
+    else:
+        trade_log["entry_bar_ts"] = pd.to_datetime(trade_log["entry_ts"], utc=True, errors="coerce")
+        trade_log["exit_bar_ts"] = pd.to_datetime(trade_log["exit_ts"], utc=True, errors="coerce")
+        trade_log["gross_pnl"] = pd.to_numeric(trade_log["pnl_usd"], errors="coerce")
+        trade_log["trade_cost"] = float(replay_config.round_turn_cost)
+        trade_log["net_pnl"] = trade_log["gross_pnl"] - trade_log["trade_cost"]
+        trade_log["mfe_usd"] = pd.to_numeric(trade_log["mfe_price"], errors="coerce") * CONTRACT_MULTIPLIER
+        trade_log["mae_usd"] = pd.to_numeric(trade_log["mae_price"], errors="coerce") * CONTRACT_MULTIPLIER
+        trade_log = trade_log.sort_values("exit_bar_ts").reset_index(drop=True)
+        trade_log = trade_log[trade_columns]
+
+    skipped_sessions = session_table.loc[
+        ~session_table["session_id"].isin(session_summary["session_id"])
+    ].copy()
+    if not skipped_sessions.empty:
+        skipped_sessions["ts_event"] = skipped_sessions["session_open_ts"]
+        skipped_sessions["reason"] = "Missing prior-session breakout inputs or stop-distance."
+        skipped_sessions = skipped_sessions[
+            [
+                "session_id",
+                "session_date",
+                "ts_event",
+                "reason",
+            ]
+        ].reset_index(drop=True)
+    else:
+        skipped_sessions = pd.DataFrame(columns=["session_id", "session_date", "ts_event", "reason"])
+
+    concurrency_log = _build_intrabar_concurrency_log(frame_state)
+    equity_curve = _build_intrabar_equity_curve(
+        minute_bars=minute_bars,
+        trade_log=trade_log,
+        starting_capital=replay_config.starting_capital,
+    )
+    session_equity = (
+        equity_curve.loc[equity_curve["session_close_bar"]].copy().reset_index(drop=True)
+        if not equity_curve.empty
+        else pd.DataFrame()
+    )
+
+    gc_price_curve, gc_price_session_equity = _build_intrabar_gc_price_benchmark(
+        minute_bars=minute_bars,
+        starting_capital=replay_config.starting_capital,
+    )
+    benchmark_curves = equity_curve.copy()
+    if not gc_price_curve.empty:
+        benchmark_curves = benchmark_curves.merge(
+            gc_price_curve[
+                [
+                    "ts_event",
+                    "gc_price_index_equity",
+                    "gc_price_index_drawdown_pct",
+                ]
+            ],
+            on="ts_event",
+            how="left",
+            validate="one_to_one",
+        )
+
+    empty_df = pd.DataFrame()
+    performance_summary = historical_backtest._build_performance_summary(
+        trade_log=trade_log,
+        session_equity=session_equity,
+        concurrency_df=concurrency_log,
+        floor_events_df=empty_df,
+        order_cancellations_df=empty_df,
+        margin_flags_df=empty_df,
+        session_sizing_df=empty_df,
+        skipped_sessions_df=skipped_sessions,
+        config=replay_config,
+    )
+    direction_summary = historical_backtest._build_direction_summary(trade_log)
+    annual_summary = historical_backtest._build_annual_summary(session_equity, trade_log)
+    exit_breakdown = historical_backtest._build_exit_breakdown(trade_log)
+    benchmark_summary = _build_recent_benchmark_summary(
+        strategy_session_equity=session_equity,
+        gc_price_session_equity=gc_price_session_equity,
+        config=replay_config,
+    )
+
+    result = RecentIntrabarResult(
+        config=replay_config,
+        data=minute_bars,
+        session_table=session_table,
+        trade_log=trade_log,
+        roll_events=pd.DataFrame(columns=["roll_ts"]),
+        order_cancellations=empty_df.copy(),
+        floor_events=empty_df.copy(),
+        margin_flags=empty_df.copy(),
+        skipped_sessions=skipped_sessions,
+        event_log=event_log,
+        equity_curve=equity_curve,
+        session_equity=session_equity,
+        performance_summary=performance_summary,
+        direction_summary=direction_summary,
+        annual_summary=annual_summary,
+        exit_breakdown=exit_breakdown,
+        benchmark_curves=benchmark_curves,
+        benchmark_summary=benchmark_summary,
+        validation_results=pd.DataFrame(),
+        diagnostics={
+            "concurrency_log": concurrency_log,
+            "hourly_bars": context.get("hourly_bars", pd.DataFrame()).copy(),
+            "hourly_bars_forward_filled": context.get("hourly_bars_forward_filled", pd.DataFrame()).copy(),
+            "metadata": dict(context.get("metadata", {})),
+            "audit": context.get("audit", {}),
+            "notes": list(context.get("notes", [])),
+            "data_paths": dict(context.get("data_paths", {})),
+        },
+        frame_state=frame_state,
+        session_summary=session_summary,
+    )
+    result.validation_results = _build_recent_validation_results(result)
+    return result
+
+
+def run_recent_intrabar_sensitivity_analysis(
+    context: dict[str, Any],
+    replay_config: RecentIntrabarReplayConfig,
+) -> dict[str, pd.DataFrame]:
+    _validate_replay_config(replay_config)
+    rows: list[dict[str, Any]] = []
+    for atr_period in replay_config.sensitivity_atr_periods:
+        for tp_sl_mode in replay_config.sensitivity_tp_sl_modes:
+            k_values = replay_config.sensitivity_ks if tp_sl_mode == "prior_day_range" else (replay_config.k,)
+            for atr_multiplier in replay_config.sensitivity_atr_multipliers:
+                for k_value in k_values:
+                    candidate = replace(
+                        replay_config,
+                        atr_period=atr_period,
+                        tp_sl_mode=tp_sl_mode,
+                        atr_multiplier=atr_multiplier,
+                        k=k_value,
+                    )
+                    candidate_result = run_recent_intrabar_backtest(context, candidate)
+                    metrics = candidate_result.performance_summary
+                    rows.append(
+                        {
+                            "atr_period": atr_period,
+                            "tp_sl_mode": tp_sl_mode,
+                            "atr_multiplier": atr_multiplier,
+                            "k": k_value,
+                            "win_rate": metrics.get("win_rate_pct", np.nan),
+                            "profit_factor": metrics.get("profit_factor", np.nan),
+                            "sharpe_ratio": metrics.get("sharpe_ratio", np.nan),
+                            "max_drawdown_pct": metrics.get("max_drawdown_pct", np.nan),
+                            "terminal_net_equity": metrics.get("terminal_net_equity", np.nan),
+                            "total_return_pct": metrics.get("total_return_pct", np.nan),
+                            "total_trades": metrics.get("total_trades", np.nan),
+                        }
+                    )
+    primary_grid = pd.DataFrame(rows)
+    return {"primary_grid": primary_grid}
+
+
+def _subset_context_by_session_date_range(
+    context: dict[str, Any],
+    start_session_date: pd.Timestamp,
+    end_session_date: pd.Timestamp,
+) -> dict[str, Any]:
+    session_table = context["session_table"].copy()
+    session_mask = session_table["session_date"].ge(start_session_date) & session_table["session_date"].lt(end_session_date)
+    subset_sessions = session_table.loc[session_mask].copy().reset_index(drop=True)
+    subset_ids = subset_sessions["session_id"].tolist()
+    minute_bars = context["minute_bars"].loc[context["minute_bars"]["session_id"].isin(subset_ids)].copy().reset_index(drop=True)
+    hourly_bars = context.get("hourly_bars", pd.DataFrame())
+    hourly_forward_filled = context.get("hourly_bars_forward_filled", pd.DataFrame())
+    subset_hourly = hourly_bars.loc[hourly_bars["session_id"].isin(subset_ids)].copy().reset_index(drop=True)
+    subset_hourly_ff = hourly_forward_filled.loc[
+        hourly_forward_filled["session_id"].isin(subset_ids)
+    ].copy().reset_index(drop=True)
+    subset_continuous = context.get("continuous_data", pd.DataFrame())
+    subset_clean = context.get("clean_data", pd.DataFrame())
+    subset_dominant = context.get("dominant_table", pd.DataFrame())
+    if not subset_continuous.empty:
+        subset_continuous = subset_continuous.loc[subset_continuous["session_id"].isin(subset_ids)].copy().reset_index(drop=True)
+    if not subset_clean.empty and "session_id" in subset_clean.columns:
+        subset_clean = subset_clean.loc[subset_clean["session_id"].isin(subset_ids)].copy().reset_index(drop=True)
+    if not subset_dominant.empty:
+        subset_dominant = subset_dominant.loc[subset_dominant["session_id"].isin(subset_ids)].copy().reset_index(drop=True)
+    metadata = dict(context.get("metadata", {}))
+    metadata.update(
+        {
+            "subset_train_start": start_session_date.isoformat(),
+            "subset_end_exclusive": end_session_date.isoformat(),
+            "subset_session_count": int(subset_sessions.shape[0]),
+            "subset_minute_bar_count": int(minute_bars.shape[0]),
+        }
+    )
+    return {
+        "config": context["config"],
+        "metadata": metadata,
+        "data_paths": dict(context.get("data_paths", {})),
+        "raw_data": context.get("raw_data", pd.DataFrame()),
+        "clean_data": subset_clean,
+        "audit": context.get("audit", {}),
+        "notes": list(context.get("notes", [])),
+        "minute_bars": minute_bars,
+        "session_table": subset_sessions,
+        "dominant_table": subset_dominant,
+        "continuous_data": subset_continuous,
+        "hourly_bars": subset_hourly,
+        "hourly_bars_forward_filled": subset_hourly_ff,
+    }
+
+
+def _build_recent_walk_forward_windows(
+    replay_config: RecentIntrabarReplayConfig,
+    session_table: pd.DataFrame,
+) -> pd.DataFrame:
+    if session_table.empty:
+        return pd.DataFrame()
+    unique_dates = session_table["session_date"].drop_duplicates().sort_values().reset_index(drop=True)
+    first_session_date = pd.Timestamp(unique_dates.iloc[0])
+    last_session_date_exclusive = pd.Timestamp(unique_dates.iloc[-1]) + pd.Timedelta(days=1)
+    windows: list[dict[str, Any]] = []
+    fold_id = 1
+    train_start = first_session_date
+    while True:
+        train_end = train_start + pd.DateOffset(months=replay_config.walk_forward_train_months)
+        test_start = train_end
+        test_end = test_start + pd.DateOffset(months=replay_config.walk_forward_test_months)
+        if test_end > last_session_date_exclusive:
+            break
+        train_mask = session_table["session_date"].ge(train_start) & session_table["session_date"].lt(train_end)
+        test_mask = session_table["session_date"].ge(test_start) & session_table["session_date"].lt(test_end)
+        if not train_mask.any() or not test_mask.any():
+            break
+        windows.append(
+            {
+                "fold_id": fold_id,
+                "train_start": train_start,
+                "train_end": train_end,
+                "test_start": test_start,
+                "test_end": test_end,
+                "train_sessions": int(train_mask.sum()),
+                "test_sessions": int(test_mask.sum()),
+            }
+        )
+        fold_id += 1
+        train_start = train_start + pd.DateOffset(months=replay_config.walk_forward_step_months)
+    return pd.DataFrame(windows)
+
+
+def _recent_walk_forward_candidate_configs(
+    replay_config: RecentIntrabarReplayConfig,
+) -> list[RecentIntrabarReplayConfig]:
+    candidates: list[RecentIntrabarReplayConfig] = []
+    for atr_period in replay_config.walk_forward_atr_periods:
+        for tp_sl_mode in replay_config.walk_forward_tp_sl_modes:
+            k_values = replay_config.walk_forward_ks if tp_sl_mode == "prior_day_range" else (replay_config.k,)
+            for atr_multiplier in replay_config.walk_forward_atr_multipliers:
+                for k_value in k_values:
+                    candidates.append(
+                        replace(
+                            replay_config,
+                            atr_period=atr_period,
+                            tp_sl_mode=tp_sl_mode,
+                            atr_multiplier=atr_multiplier,
+                            k=k_value,
+                        )
+                    )
+    return candidates
+
+
+def run_recent_intrabar_walk_forward_analysis(
+    context: dict[str, Any],
+    replay_config: RecentIntrabarReplayConfig,
+) -> RecentIntrabarWalkForwardResult:
+    _validate_replay_config(replay_config)
+    fold_windows = _build_recent_walk_forward_windows(replay_config, context["session_table"])
+    if fold_windows.empty:
+        raise ValueError("No complete walk-forward folds are available for the configured month-based windows.")
+
+    candidate_configs = _recent_walk_forward_candidate_configs(replay_config)
+    optimization_rows: list[dict[str, Any]] = []
+    fold_rows: list[dict[str, Any]] = []
+    oos_equity_frames: list[pd.DataFrame] = []
+    oos_trade_frames: list[pd.DataFrame] = []
+    subset_cache: dict[tuple[int, str], dict[str, Any]] = {}
+
+    for fold in fold_windows.to_dict("records"):
+        fold_id = int(fold["fold_id"])
+        best_candidate: RecentIntrabarReplayConfig | None = None
+        best_train_result: RecentIntrabarResult | None = None
+        best_selection_key: tuple[float, float, float, float, float] | None = None
+
+        train_cache_key = (fold_id, "train")
+        if train_cache_key not in subset_cache:
+            subset_cache[train_cache_key] = _subset_context_by_session_date_range(
+                context,
+                pd.Timestamp(fold["train_start"]),
+                pd.Timestamp(fold["train_end"]),
+            )
+        train_context = subset_cache[train_cache_key]
+
+        for candidate in candidate_configs:
+            train_result = run_recent_intrabar_backtest(train_context, candidate)
+            train_metrics = train_result.performance_summary
+            objective_value = historical_backtest._walk_forward_objective_value(
+                train_metrics,
+                replay_config.walk_forward_objective,
+            )
+            optimization_rows.append(
+                {
+                    "fold_id": fold_id,
+                    "train_start": fold["train_start"],
+                    "train_end": fold["train_end"],
+                    "test_start": fold["test_start"],
+                    "test_end": fold["test_end"],
+                    "atr_period": candidate.atr_period,
+                    "tp_sl_mode": candidate.tp_sl_mode,
+                    "atr_multiplier": candidate.atr_multiplier,
+                    "k": candidate.k,
+                    "objective": replay_config.walk_forward_objective,
+                    "train_objective_value": objective_value,
+                    "train_sharpe_ratio": train_metrics.get("sharpe_ratio", np.nan),
+                    "train_total_return_pct": train_metrics.get("total_return_pct", np.nan),
+                    "train_max_drawdown_pct": train_metrics.get("max_drawdown_pct", np.nan),
+                    "train_total_trades": train_metrics.get("total_trades", np.nan),
+                }
+            )
+            selection_key = historical_backtest._walk_forward_selection_key(
+                train_metrics,
+                replay_config.walk_forward_objective,
+            )
+            if best_selection_key is None or selection_key > best_selection_key:
+                best_selection_key = selection_key
+                best_candidate = candidate
+                best_train_result = train_result
+
+        if best_candidate is None or best_train_result is None:
+            raise ValueError(f"Walk-forward fold {fold_id} produced no candidate results.")
+
+        test_cache_key = (fold_id, "test")
+        if test_cache_key not in subset_cache:
+            subset_cache[test_cache_key] = _subset_context_by_session_date_range(
+                context,
+                pd.Timestamp(fold["test_start"]),
+                pd.Timestamp(fold["test_end"]),
+            )
+        test_context = subset_cache[test_cache_key]
+        oos_result = run_recent_intrabar_backtest(test_context, best_candidate)
+        oos_metrics = oos_result.performance_summary
+        train_metrics = best_train_result.performance_summary
+
+        fold_rows.append(
+            {
+                "fold_id": fold_id,
+                "train_start": fold["train_start"],
+                "train_end": fold["train_end"],
+                "test_start": fold["test_start"],
+                "test_end": fold["test_end"],
+                "train_sessions": fold["train_sessions"],
+                "test_sessions": fold["test_sessions"],
+                "objective": replay_config.walk_forward_objective,
+                "selected_atr_period": best_candidate.atr_period,
+                "selected_tp_sl_mode": best_candidate.tp_sl_mode,
+                "selected_atr_multiplier": best_candidate.atr_multiplier,
+                "selected_k": best_candidate.k,
+                "train_objective_value": historical_backtest._walk_forward_objective_value(
+                    train_metrics,
+                    replay_config.walk_forward_objective,
+                ),
+                "train_sharpe_ratio": train_metrics.get("sharpe_ratio", np.nan),
+                "train_total_return_pct": train_metrics.get("total_return_pct", np.nan),
+                "train_max_drawdown_pct": train_metrics.get("max_drawdown_pct", np.nan),
+                "train_total_trades": train_metrics.get("total_trades", np.nan),
+                "oos_sharpe_ratio": oos_metrics.get("sharpe_ratio", np.nan),
+                "oos_total_return_pct": oos_metrics.get("total_return_pct", np.nan),
+                "oos_max_drawdown_pct": oos_metrics.get("max_drawdown_pct", np.nan),
+                "oos_total_trades": oos_metrics.get("total_trades", np.nan),
+                "oos_terminal_net_equity": oos_metrics.get("terminal_net_equity", np.nan),
+            }
+        )
+
+        if not oos_result.equity_curve.empty:
+            oos_equity = oos_result.equity_curve.copy()
+            oos_equity["fold_id"] = fold_id
+            oos_equity["selected_atr_period"] = best_candidate.atr_period
+            oos_equity["selected_tp_sl_mode"] = best_candidate.tp_sl_mode
+            oos_equity["selected_atr_multiplier"] = best_candidate.atr_multiplier
+            oos_equity["selected_k"] = best_candidate.k
+            oos_equity_frames.append(oos_equity)
+        if not oos_result.trade_log.empty:
+            oos_trade_log = oos_result.trade_log.copy()
+            oos_trade_log["fold_id"] = fold_id
+            oos_trade_log["selected_atr_period"] = best_candidate.atr_period
+            oos_trade_log["selected_tp_sl_mode"] = best_candidate.tp_sl_mode
+            oos_trade_log["selected_atr_multiplier"] = best_candidate.atr_multiplier
+            oos_trade_log["selected_k"] = best_candidate.k
+            oos_trade_frames.append(oos_trade_log)
+
+    fold_summary = pd.DataFrame(fold_rows)
+    optimization_results = pd.DataFrame(optimization_rows)
+    parameter_stability = historical_backtest._build_walk_forward_parameter_stability(
+        fold_summary.rename(
+            columns={
+                "selected_atr_period": "atr_period",
+                "selected_tp_sl_mode": "tp_sl_mode",
+                "selected_atr_multiplier": "atr_multiplier",
+                "selected_k": "k",
+            }
+        )
+    )
+    oos_equity_curve, oos_session_equity = historical_backtest._stitch_walk_forward_oos_equity(
+        oos_equity_frames=oos_equity_frames,
+        starting_capital=replay_config.starting_capital,
+    )
+    oos_trade_log = pd.concat(oos_trade_frames, ignore_index=True) if oos_trade_frames else pd.DataFrame()
+    diagnostics = {
+        "fold_windows": fold_windows,
+        "candidate_count": len(candidate_configs),
+        "objective": replay_config.walk_forward_objective,
+    }
+    return RecentIntrabarWalkForwardResult(
+        config=replay_config,
+        fold_summary=fold_summary,
+        optimization_results=optimization_results,
+        parameter_stability=parameter_stability,
+        oos_equity_curve=oos_equity_curve,
+        oos_session_equity=oos_session_equity,
+        oos_trade_log=oos_trade_log,
+        diagnostics=diagnostics,
+    )
+
+
 def _dedupe_legend(ax: plt.Axes) -> None:
     handles, labels = ax.get_legend_handles_labels()
     deduped_handles: list[Any] = []
@@ -991,3 +1940,177 @@ def plot_intrabar_session_replay(
     _render_intrabar_session_frame(ax, diagnostic, session_id, end_bar_index=None)
     figure.tight_layout()
     return figure
+
+
+def animate_intrabar_session_replay(
+    diagnostic: dict[str, Any],
+    session_id: int,
+    figsize: tuple[float, float] = (15.0, 7.5),
+) -> FuncAnimation:
+    figure, ax = plt.subplots(figsize=figsize)
+    session_frames = (
+        diagnostic["frame_state"]
+        .loc[diagnostic["frame_state"]["session_id"].eq(session_id)]
+        .sort_values("bar_index")
+        .reset_index(drop=True)
+    )
+    if session_frames.empty:
+        raise ValueError(f"No intrabar replay data is available for session_id={session_id}.")
+    frame_step = max(1, int(diagnostic["replay_config"].frame_step))
+    frame_indices = session_frames["bar_index"].iloc[::frame_step].astype(int).tolist()
+    final_index = int(session_frames["bar_index"].iloc[-1])
+    if not frame_indices or frame_indices[-1] != final_index:
+        frame_indices.append(final_index)
+
+    def _update(end_bar_index: int) -> list[Any]:
+        _render_intrabar_session_frame(ax, diagnostic, session_id, end_bar_index=end_bar_index)
+        artists: list[Any] = []
+        artists.extend(ax.lines)
+        artists.extend(ax.collections)
+        artists.extend(ax.patches)
+        artists.extend(ax.texts)
+        return artists
+
+    animation = FuncAnimation(
+        figure,
+        _update,
+        frames=frame_indices,
+        interval=int(diagnostic["replay_config"].animation_interval_ms),
+        blit=False,
+        repeat=False,
+    )
+    plt.close(figure)
+    return animation
+
+
+def _empty_figure(message: str, figsize: tuple[float, float]) -> plt.Figure:
+    figure, ax = plt.subplots(figsize=figsize)
+    ax.text(0.5, 0.5, message, ha="center", va="center")
+    ax.set_axis_off()
+    figure.tight_layout()
+    return figure
+
+
+def plot_equity_curve(result: RecentIntrabarResult) -> plt.Figure:
+    if result.equity_curve.empty:
+        return _empty_figure("No equity curve is available for the current recent sample.", (12.0, 5.0))
+    return historical_backtest.plot_equity_curve(result)
+
+
+def plot_drawdown_curve(result: RecentIntrabarResult) -> plt.Figure:
+    if result.equity_curve.empty:
+        return _empty_figure("No drawdown curve is available for the current recent sample.", (12.0, 4.0))
+    return historical_backtest.plot_drawdown_curve(result)
+
+
+def plot_directional_equity_curves(result: RecentIntrabarResult) -> plt.Figure:
+    return historical_backtest.plot_directional_equity_curves(result)
+
+
+def plot_directional_drawdown_curves(result: RecentIntrabarResult) -> plt.Figure:
+    return historical_backtest.plot_directional_drawdown_curves(result)
+
+
+def plot_monthly_returns_heatmap(result: RecentIntrabarResult) -> plt.Figure:
+    if result.session_equity.empty or result.session_equity.shape[0] < 2:
+        return _empty_figure("At least two session closes are required for monthly return heatmaps.", (12.0, 5.0))
+    monthly = (
+        result.session_equity.set_index("ts_event")["net_equity"].resample("M").last().pct_change().dropna() * 100.0
+    )
+    if monthly.empty:
+        return _empty_figure("Monthly returns are not available for the current recent sample.", (12.0, 5.0))
+    monthly = monthly.to_frame("return_pct")
+    monthly["year"] = monthly.index.year
+    monthly["month"] = monthly.index.month
+    heatmap = monthly.pivot(index="year", columns="month", values="return_pct").sort_index()
+    figure, ax = plt.subplots(figsize=(12, 5))
+    image = ax.imshow(heatmap.values, aspect="auto", cmap="RdYlGn", interpolation="nearest")
+    ax.set_title("Monthly Net Returns Heatmap (%)")
+    ax.set_xticks(np.arange(12))
+    ax.set_xticklabels(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    )
+    ax.set_yticks(np.arange(len(heatmap.index)))
+    ax.set_yticklabels(heatmap.index.tolist())
+    figure.colorbar(image, ax=ax, shrink=0.8)
+    figure.tight_layout()
+    return figure
+
+
+def plot_trade_pnl_distribution(result: RecentIntrabarResult) -> plt.Figure:
+    if result.trade_log.empty:
+        return _empty_figure("No closed trades are available for a PnL distribution chart.", (12.0, 8.0))
+    return historical_backtest.plot_trade_pnl_distribution(result)
+
+
+def plot_exit_reason_breakdown(result: RecentIntrabarResult) -> plt.Figure:
+    if result.trade_log.empty:
+        return _empty_figure("No closed trades are available for an exit breakdown chart.", (8.0, 4.0))
+    return historical_backtest.plot_exit_reason_breakdown(result)
+
+
+def plot_heatmap_grid(
+    primary_grid: pd.DataFrame,
+    metric: str,
+    atr_period: int,
+    tp_sl_modes: tuple[str, ...] = VALID_TP_SL_MODES,
+) -> plt.Figure:
+    subset = primary_grid.loc[primary_grid["atr_period"] == atr_period].copy()
+    if subset.empty or subset[metric].dropna().empty:
+        return _empty_figure("No sensitivity data is available for the selected ATR period.", (16.0, 4.0))
+    figure, axes = plt.subplots(1, len(tp_sl_modes), figsize=(16, 4), sharey=True)
+    if len(tp_sl_modes) == 1:
+        axes = [axes]
+    for axis, mode in zip(axes, tp_sl_modes):
+        mode_grid = subset.loc[subset["tp_sl_mode"] == mode]
+        if mode_grid.empty:
+            axis.text(0.5, 0.5, "No data", ha="center", va="center")
+            axis.set_axis_off()
+            continue
+        pivot = mode_grid.pivot(index="atr_multiplier", columns="k", values=metric).sort_index()
+        image = axis.imshow(pivot.values, aspect="auto", cmap="viridis", interpolation="nearest")
+        axis.set_title(f"{mode}\n{metric}")
+        axis.set_xticks(np.arange(len(pivot.columns)))
+        axis.set_xticklabels([f"{value:.2f}" for value in pivot.columns])
+        axis.set_yticks(np.arange(len(pivot.index)))
+        axis.set_yticklabels([f"{value:.2f}" for value in pivot.index])
+        axis.set_xlabel("k")
+        axis.set_ylabel("ATR multiplier")
+        figure.colorbar(image, ax=axis, shrink=0.8)
+    figure.tight_layout()
+    return figure
+
+
+def plot_trail_sensitivity_curve(
+    primary_grid: pd.DataFrame,
+    replay_config: RecentIntrabarReplayConfig,
+) -> plt.Figure:
+    subset = primary_grid.loc[
+        (primary_grid["atr_period"] == replay_config.atr_period)
+        & (primary_grid["tp_sl_mode"] == replay_config.tp_sl_mode)
+        & (primary_grid["k"] == replay_config.k)
+    ].sort_values("atr_multiplier")
+    if subset.empty:
+        return _empty_figure("No trail-sensitivity data is available for the selected configuration.", (10.0, 4.0))
+    figure, ax1 = plt.subplots(figsize=(10, 4))
+    ax2 = ax1.twinx()
+    ax1.plot(subset["atr_multiplier"], subset["win_rate"], marker="o", label="Win rate %")
+    ax2.plot(subset["atr_multiplier"], subset["sharpe_ratio"], marker="s", color="darkorange", label="Sharpe")
+    ax1.set_title("Trail Sensitivity")
+    ax1.set_xlabel("ATR multiplier")
+    ax1.set_ylabel("Win rate %")
+    ax2.set_ylabel("Sharpe ratio")
+    ax1.grid(True, alpha=0.2)
+    figure.tight_layout()
+    return figure
+
+
+def plot_session_replay(result: RecentIntrabarResult, session_id: int) -> plt.Figure:
+    diagnostic = {
+        "replay_config": result.config,
+        "minute_bars": result.data,
+        "event_log": result.event_log,
+        "trade_log": result.trade_log,
+        "frame_state": result.frame_state,
+    }
+    return plot_intrabar_session_replay(diagnostic, session_id)
